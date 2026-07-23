@@ -29,11 +29,11 @@
 
 ## 验收标准
 
-- [ ] GitHub 公开仓库 zhangjianyong66/ssh-tunnel-manager 创建成功。
-- [ ] origin 指向该仓库，协议为 HTTPS。
-- [ ] master 分支推送成功，远程包含提交 692de71。
-- [ ] GitHub API/CLI 显示仓库 visibility 为 PUBLIC。
-- [ ] README 可作为仓库首页展示，且敏感信息扫描通过。
+- [x] GitHub 公开仓库 zhangjianyong66/ssh-tunnel-manager 创建成功。
+- [x] origin 指向该仓库，协议为 HTTPS。
+- [x] master 分支推送成功，远程包含提交 692de71。
+- [x] GitHub API/CLI 显示仓库 visibility 为 PUBLIC。
+- [x] README 可作为仓库首页展示，且敏感信息扫描通过。
 - [x] 许可证决策已记录，并添加 MIT LICENSE 文件。
 
 ## 不在范围内
