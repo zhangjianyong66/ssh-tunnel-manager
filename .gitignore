@@ -1,0 +1,6 @@
+/ssh-tunnel-manager
+/bin/
+/dist/
+/coverage.out
+*.log
+.DS_Store
