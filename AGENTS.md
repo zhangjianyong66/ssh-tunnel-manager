@@ -38,6 +38,7 @@ go build ./cmd/ssh-tunnel-manager
 - 本地开发使用 go run ./cmd/ssh-tunnel-manager，默认控制台地址为 127.0.0.1:8765；构建使用 go build -o ssh-tunnel-manager ./cmd/ssh-tunnel-manager。
 - 当前 MVP 没有 _test.go 文件，但所有行为变更仍需运行 go test ./...、go vet ./... 和构建命令；新增功能应在对应 Go 包旁添加单元测试。
 - 当前部署是直接运行单文件 Linux 可执行程序，没有安装脚本、systemd 单元或容器暴露配置；不得通过部署配置把回环服务暴露到局域网或公网。
+- 源码公开仓库为 https://github.com/zhangjianyong66/ssh-tunnel-manager.git，默认分支为 master，使用 GitHub CLI 登录账号通过 HTTPS 推送。
 
 所有计划、设计和提交说明使用中文。新增可复用的运行方式、目录结构或部署约定时，及时更新本文件。
 <!-- TRELLIS:START -->

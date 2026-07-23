@@ -44,3 +44,7 @@ go.mod                   Go 模块定义
 - 不开放公网或局域网访问。
 - SSH 凭据不写入普通配置文件，持久化方案使用 Linux Secret Service / GNOME Keyring。
 - 系统 `~/.ssh/config` 只读，不由程序直接改写。
+
+## 许可证
+
+本项目使用 MIT License，详见 [LICENSE](LICENSE)。
