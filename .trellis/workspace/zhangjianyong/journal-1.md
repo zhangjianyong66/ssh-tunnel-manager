@@ -72,3 +72,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: 完成M1 SSH配置与连接
+
+**Date**: 2026-07-24
+**Task**: 完成M1 SSH配置与连接
+**Branch**: `master`
+
+### Summary
+
+实现SSH配置Include解析、OpenSSH ControlMaster连接、askpass命名管道、Secret Service D-Bus凭据存储、本地Web API与退出清理，并通过竞态测试、静态检查、构建和运行时冒烟验证。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ac7c202` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
