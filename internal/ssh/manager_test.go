@@ -131,6 +131,37 @@ func (unavailableCredentialStore) Delete(context.Context, credential.Ref) error 
 	return credential.ErrUnavailable
 }
 
+type recordingCredentialStore struct {
+	mu      sync.Mutex
+	values  map[credential.Ref]string
+	lookups []credential.Ref
+}
+
+func (s *recordingCredentialStore) Lookup(_ context.Context, ref credential.Ref) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lookups = append(s.lookups, ref)
+	value, ok := s.values[ref]
+	if !ok {
+		return "", credential.ErrNotFound
+	}
+	return value, nil
+}
+
+func (s *recordingCredentialStore) Save(_ context.Context, ref credential.Ref, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.values[ref] = value
+	return nil
+}
+
+func (s *recordingCredentialStore) Delete(_ context.Context, ref credential.Ref) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.values, ref)
+	return nil
+}
+
 func (r *fakeRunner) Start(_ context.Context, spec CommandSpec) (Process, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -210,6 +241,48 @@ func TestManagerConnectIsIdempotent(t *testing.T) {
 	}
 	if len(runner.specs) != 1 {
 		t.Fatalf("start count = %d, want 1", len(runner.specs))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _ = manager.Disconnect(ctx, "server-a")
+}
+
+func TestManagerReconnectReusesCredentialUsername(t *testing.T) {
+	store := &recordingCredentialStore{values: map[credential.Ref]string{
+		{Host: "server-a", Username: "alice", Purpose: "password"}: "saved-password",
+	}}
+	runner := &fakeRunner{process: newFakeProcess()}
+	manager, err := NewManager(runner, store, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Connect(context.Background(), "server-a", ConnectOptions{Username: "alice"}); err != nil {
+		t.Fatal(err)
+	}
+	runner.mu.Lock()
+	first := runner.process
+	runner.mu.Unlock()
+	first.finish(errors.New("connection lost"), "connection reset")
+	deadline := time.Now().Add(time.Second)
+	for manager.Snapshot("server-a").Status != StatusFailed && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	runner.mu.Lock()
+	runner.process = newFakeProcess()
+	runner.mu.Unlock()
+	if _, err := manager.Connect(context.Background(), "server-a", ConnectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	lookups := append([]credential.Ref(nil), store.lookups...)
+	store.mu.Unlock()
+	if len(lookups) < 4 {
+		t.Fatalf("credential lookups = %#v", lookups)
+	}
+	for _, ref := range lookups {
+		if ref.Username != "alice" {
+			t.Fatalf("credential username was not reused: %#v", lookups)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -528,5 +601,16 @@ func TestClassifyErrorMatrix(t *testing.T) {
 		if got := classifyError(test.diagnostic, "fallback").Code; got != test.want {
 			t.Errorf("classifyError(%q) = %q, want %q", test.diagnostic, got, test.want)
 		}
+	}
+}
+
+func TestRealProcessDiagnosticsRedactsControlPath(t *testing.T) {
+	buffer := &limitedBuffer{limit: commandOutputLimit}
+	controlPath := "/tmp/ssh-tunnel-manager-private/session/c"
+	_, _ = buffer.Write([]byte("mux client failed for " + controlPath))
+	process := &realProcess{stderr: buffer, secrets: []string{controlPath}}
+	diagnostic := process.Diagnostics()
+	if strings.Contains(diagnostic, controlPath) || !strings.Contains(diagnostic, "[已隐藏]") {
+		t.Fatalf("diagnostic was not redacted: %q", diagnostic)
 	}
 }

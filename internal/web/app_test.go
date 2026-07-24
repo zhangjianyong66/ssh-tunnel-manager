@@ -43,10 +43,11 @@ type fakeTunnels struct {
 	stopIDs        []string
 	stoppedHosts   []string
 	onStopHost     func(string)
+	logs           map[string][]tunnel.LogEntry
 }
 
 func newFakeTunnels() *fakeTunnels {
-	return &fakeTunnels{snapshots: []tunnel.Snapshot{}}
+	return &fakeTunnels{snapshots: []tunnel.Snapshot{}, logs: make(map[string][]tunnel.LogEntry)}
 }
 
 func (f *fakeTunnels) Create(_ context.Context, host string, remotePort uint16) (tunnel.Snapshot, error) {
@@ -74,6 +75,13 @@ func (f *fakeTunnels) List() []tunnel.Snapshot {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]tunnel.Snapshot(nil), f.snapshots...)
+}
+
+func (f *fakeTunnels) Logs(id string) ([]tunnel.LogEntry, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	logs, ok := f.logs[id]
+	return append([]tunnel.LogEntry(nil), logs...), ok
 }
 
 func (f *fakeTunnels) Stop(_ context.Context, id string) error {
@@ -165,6 +173,33 @@ func (f *fakeSessions) Snapshot(host string) sshmanager.Snapshot {
 		return state
 	}
 	return sshmanager.Snapshot{Host: host, Status: sshmanager.StatusDisconnected}
+}
+
+type fakePreferences struct {
+	mu      sync.Mutex
+	values  map[string]bool
+	setErr  error
+	readErr error
+}
+
+func newFakePreferences() *fakePreferences {
+	return &fakePreferences{values: make(map[string]bool)}
+}
+
+func (f *fakePreferences) AutoRefresh(host string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.values[host], f.readErr
+}
+
+func (f *fakePreferences) SetAutoRefresh(host string, enabled bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.setErr != nil {
+		return f.setErr
+	}
+	f.values[host] = enabled
+	return nil
 }
 
 func TestAppHostsAndConnectDoNotEchoSecret(t *testing.T) {
@@ -264,6 +299,62 @@ func TestAppPortDiscoveryRoutes(t *testing.T) {
 	}
 }
 
+func TestAppPersistsAndRestoresAutoRefreshAfterManualConnect(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sessions := newFakeSessions()
+	ports := newFakePorts()
+	preferences := newFakePreferences()
+	preferences.values["server-a"] = true
+	app, err := NewApp(configPath, sessions, ports, newFakeTunnels(), preferences)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ports.Snapshot("server-a").AutoRefresh {
+		t.Fatal("preference triggered refresh before manual connection")
+	}
+	connect := httptest.NewRequest(http.MethodPost, "/api/servers/server-a/connect", strings.NewReader(`{}`))
+	connectResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(connectResponse, connect)
+	if connectResponse.Code != http.StatusOK || !ports.Snapshot("server-a").AutoRefresh {
+		t.Fatalf("connect = %d %s, ports = %#v", connectResponse.Code, connectResponse.Body.String(), ports.Snapshot("server-a"))
+	}
+
+	auto := httptest.NewRequest(http.MethodPut, "/api/servers/server-a/ports/auto-refresh", strings.NewReader(`{"enabled":false}`))
+	autoResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(autoResponse, auto)
+	if autoResponse.Code != http.StatusOK || preferences.values["server-a"] || ports.Snapshot("server-a").AutoRefresh {
+		t.Fatalf("disable = %d %s", autoResponse.Code, autoResponse.Body.String())
+	}
+}
+
+func TestAppPreferenceWriteFailureDoesNotChangeRuntimeRefresh(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sessions := newFakeSessions()
+	sessions.states["server-a"] = sshmanager.Snapshot{Host: "server-a", Status: sshmanager.StatusConnected}
+	preferences := newFakePreferences()
+	preferences.setErr = errors.New("disk unavailable")
+	ports := newFakePorts()
+	app, err := NewApp(configPath, sessions, ports, newFakeTunnels(), preferences)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/api/servers/server-a/ports/auto-refresh", strings.NewReader(`{"enabled":true}`))
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "preference_write_failed") {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	if ports.Snapshot("server-a").AutoRefresh {
+		t.Fatal("runtime refresh changed after preference write failure")
+	}
+}
+
 func TestAppPortRefreshRequiresConnection(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config")
 	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
@@ -358,6 +449,29 @@ func TestAppTunnelRoutes(t *testing.T) {
 	}
 	if len(tunnels.stopIDs) != 1 || tunnels.stopIDs[0] != "tunnel-id" {
 		t.Fatalf("stop ids = %#v", tunnels.stopIDs)
+	}
+}
+
+func TestAppTunnelLogsRoute(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tunnels := newFakeTunnels()
+	tunnels.logs["tunnel-id"] = []tunnel.LogEntry{{Level: "info", Message: "SSH 隧道已运行"}}
+	app, err := NewApp(configPath, newFakeSessions(), newFakePorts(), tunnels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tunnels/tunnel-id/logs", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"logs":[`) || !strings.Contains(response.Body.String(), "SSH 隧道已运行") {
+		t.Fatalf("logs = %d %s", response.Code, response.Body.String())
+	}
+	missing := httptest.NewRecorder()
+	app.Handler().ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/api/tunnels/missing/logs", nil))
+	if missing.Code != http.StatusNotFound || !strings.Contains(missing.Body.String(), "tunnel_not_found") {
+		t.Fatalf("missing = %d %s", missing.Code, missing.Body.String())
 	}
 }
 

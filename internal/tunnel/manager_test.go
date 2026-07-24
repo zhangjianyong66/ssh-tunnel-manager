@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -85,6 +86,42 @@ type fakeStarter struct {
 	block       chan struct{}
 }
 
+type fakeConnector struct {
+	mu           sync.Mutex
+	status       sshmanager.Status
+	connectErr   error
+	connectCalls int
+	connectBlock chan struct{}
+}
+
+func (c *fakeConnector) Snapshot(host string) sshmanager.Snapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return sshmanager.Snapshot{Host: host, Status: c.status}
+}
+
+func (c *fakeConnector) Connect(ctx context.Context, host string, _ sshmanager.ConnectOptions) (sshmanager.Snapshot, error) {
+	c.mu.Lock()
+	c.connectCalls++
+	block := c.connectBlock
+	err := c.connectErr
+	c.mu.Unlock()
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return sshmanager.Snapshot{Host: host, Status: sshmanager.StatusFailed}, ctx.Err()
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil {
+		return sshmanager.Snapshot{Host: host, Status: sshmanager.StatusFailed}, err
+	}
+	c.status = sshmanager.StatusConnected
+	return sshmanager.Snapshot{Host: host, Status: c.status}, nil
+}
+
 func (s *fakeStarter) StartLocalForward(ctx context.Context, host string, localPort, remotePort uint16) (sshmanager.Process, error) {
 	if s.block != nil {
 		select {
@@ -124,7 +161,7 @@ func TestCreateUsesPreferredPortAndReturnsLoopbackAddress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Status != StatusRunning || snapshot.LocalPort != 8080 || snapshot.Address != "127.0.0.1:8080" {
+	if snapshot.Status != StatusRunning || snapshot.LocalPort != 8080 || snapshot.Address != "127.0.0.1:8080" || snapshot.RunningSince == nil || snapshot.NextRetryAt != nil {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
 	starter.mu.Lock()
@@ -234,9 +271,10 @@ func TestCreateRetriesOnlyLocalBindFailure(t *testing.T) {
 	_ = manager.Stop(context.Background(), snapshot.ID)
 }
 
-func TestUnexpectedExitRetainsFailedEntryAndCreateRebuildsIt(t *testing.T) {
+func TestUnexpectedExitAutomaticallyRebuildsEntry(t *testing.T) {
 	starter := &fakeStarter{ready: true}
 	manager := testManager(starter)
+	manager.retryDelays = []time.Duration{time.Millisecond}
 	first, err := manager.Create(context.Background(), "server-a", 8080)
 	if err != nil {
 		t.Fatal(err)
@@ -245,23 +283,224 @@ func TestUnexpectedExitRetainsFailedEntryAndCreateRebuildsIt(t *testing.T) {
 	firstProcess := starter.calls[0].process
 	starter.mu.Unlock()
 	firstProcess.finish(errors.New("exit status 255"), "secret raw output")
-	waitForStatus(t, manager, first.ID, StatusFailed)
-	failed := manager.List()[0]
-	if failed.LastError == nil || failed.LastError.Code != ErrorStartFailed || failed.LastError.Message == "secret raw output" {
-		t.Fatalf("failed snapshot = %#v", failed)
-	}
-	second, err := manager.Create(context.Background(), "server-a", 8080)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second.ID != first.ID || second.Status != StatusRunning {
-		t.Fatalf("rebuilt snapshot = %#v, first = %#v", second, first)
+	waitForReconnectCount(t, manager, first.ID, 1)
+	second := manager.List()[0]
+	if second.ID != first.ID || second.Status != StatusRunning || second.ReconnectCount != 1 {
+		t.Fatalf("automatically rebuilt snapshot = %#v, first = %#v", second, first)
 	}
 	starter.mu.Lock()
 	secondProcess := starter.calls[1].process
 	starter.mu.Unlock()
 	secondProcess.stopSignals = true
 	_ = manager.Stop(context.Background(), second.ID)
+}
+
+func TestReconnectSharesOneHostConnectionAcrossTunnels(t *testing.T) {
+	starter := &fakeStarter{ready: true}
+	connector := &fakeConnector{status: sshmanager.StatusConnected, connectBlock: make(chan struct{})}
+	manager := NewManager(starter, connector)
+	manager.startTimeout = 100 * time.Millisecond
+	manager.pollInterval = time.Millisecond
+	manager.probe = func(context.Context, uint16) bool { return true }
+	manager.retryDelays = []time.Duration{time.Millisecond}
+	first, err := manager.Create(context.Background(), "server-a", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Create(context.Background(), "server-a", 9090)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector.mu.Lock()
+	connector.status = sshmanager.StatusFailed
+	connector.mu.Unlock()
+	starter.mu.Lock()
+	firstProcess := starter.calls[0].process
+	secondProcess := starter.calls[1].process
+	starter.mu.Unlock()
+	firstProcess.finish(errors.New("connection lost"), "connection reset")
+	secondProcess.finish(errors.New("connection lost"), "connection reset")
+	waitForConnectWaiters(t, manager, "server-a", 2)
+	close(connector.connectBlock)
+	waitForReconnectCount(t, manager, first.ID, 1)
+	waitForReconnectCount(t, manager, second.ID, 1)
+	connector.mu.Lock()
+	connectCalls := connector.connectCalls
+	connector.mu.Unlock()
+	if connectCalls != 1 {
+		t.Fatalf("host connect calls = %d, want 1", connectCalls)
+	}
+	starter.mu.Lock()
+	for _, call := range starter.calls[2:] {
+		call.process.stopSignals = true
+	}
+	starter.mu.Unlock()
+	_ = manager.Close(context.Background())
+}
+
+func TestReconnectStopsImmediatelyForAuthenticationFailure(t *testing.T) {
+	starter := &fakeStarter{ready: true}
+	connector := &fakeConnector{
+		status:     sshmanager.StatusConnected,
+		connectErr: &sshmanager.Error{Code: sshmanager.ErrorAuthentication, Message: "SSH 认证失败", Diagnostic: "permission denied"},
+	}
+	manager := NewManager(starter, connector)
+	manager.startTimeout = 100 * time.Millisecond
+	manager.pollInterval = time.Millisecond
+	manager.probe = func(context.Context, uint16) bool { return true }
+	manager.retryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	snapshot, err := manager.Create(context.Background(), "server-a", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector.mu.Lock()
+	connector.status = sshmanager.StatusFailed
+	connector.mu.Unlock()
+	starter.mu.Lock()
+	starter.calls[0].process.finish(errors.New("connection lost"), "connection reset")
+	starter.mu.Unlock()
+	waitForStatus(t, manager, snapshot.ID, StatusFailed)
+	failed := manager.List()[0]
+	if failed.ReconnectCount != 1 || failed.LastError == nil || !strings.Contains(failed.LastError.Message, "人工") {
+		t.Fatalf("failed snapshot = %#v", failed)
+	}
+	connector.mu.Lock()
+	connectCalls := connector.connectCalls
+	connector.mu.Unlock()
+	if connectCalls != 1 {
+		t.Fatalf("connect calls = %d", connectCalls)
+	}
+}
+
+func TestReconnectExhaustsBoundedAttempts(t *testing.T) {
+	starter := &fakeStarter{ready: true}
+	connector := &fakeConnector{
+		status:     sshmanager.StatusConnected,
+		connectErr: &sshmanager.Error{Code: sshmanager.ErrorNetwork, Message: "无法连接到 SSH 服务器"},
+	}
+	manager := NewManager(starter, connector)
+	manager.startTimeout = 100 * time.Millisecond
+	manager.pollInterval = time.Millisecond
+	manager.probe = func(context.Context, uint16) bool { return true }
+	manager.retryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond, time.Millisecond, time.Millisecond}
+	snapshot, err := manager.Create(context.Background(), "server-a", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector.mu.Lock()
+	connector.status = sshmanager.StatusFailed
+	connector.mu.Unlock()
+	starter.mu.Lock()
+	starter.calls[0].process.finish(errors.New("connection lost"), "connection reset")
+	starter.mu.Unlock()
+	waitForStatus(t, manager, snapshot.ID, StatusFailed)
+	failed := manager.List()[0]
+	if failed.ReconnectCount != 5 || failed.LastError == nil || !strings.Contains(failed.LastError.Message, "次数") {
+		t.Fatalf("failed snapshot = %#v", failed)
+	}
+}
+
+func TestStopCancelsPendingReconnectAndClearsLogs(t *testing.T) {
+	starter := &fakeStarter{ready: true}
+	manager := testManager(starter)
+	manager.retryDelays = []time.Duration{time.Hour}
+	snapshot, err := manager.Create(context.Background(), "server-a", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	starter.mu.Lock()
+	starter.calls[0].process.finish(errors.New("connection lost"), "connection reset")
+	starter.mu.Unlock()
+	waitForStatus(t, manager, snapshot.ID, StatusWaitingReconnect)
+	if logs, ok := manager.Logs(snapshot.ID); !ok || len(logs) == 0 {
+		t.Fatalf("logs before stop = %#v, ok = %v", logs, ok)
+	}
+	if err := manager.Stop(context.Background(), snapshot.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := manager.Logs(snapshot.ID); ok {
+		t.Fatal("logs remained after stop")
+	}
+	starter.mu.Lock()
+	callCount := len(starter.calls)
+	starter.mu.Unlock()
+	if callCount != 1 {
+		t.Fatalf("start calls after cancelled retry = %d", callCount)
+	}
+}
+
+func TestTunnelLogsAreBoundedByCountAndBytes(t *testing.T) {
+	starter := &fakeStarter{ready: true}
+	manager := testManager(starter)
+	snapshot, err := manager.Create(context.Background(), "server-a", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	current := manager.byID[snapshot.ID]
+	manager.mu.Unlock()
+	current.mu.Lock()
+	for index := range 130 {
+		current.addLog(time.Unix(int64(index), 0), "info", fmt.Sprintf("event-%03d", index), strings.Repeat("x", 800))
+	}
+	current.mu.Unlock()
+	logs, ok := manager.Logs(snapshot.ID)
+	if !ok || len(logs) > maxLogEntries || len(logs) == 0 {
+		t.Fatalf("bounded logs count = %d, ok = %v", len(logs), ok)
+	}
+	total := 0
+	for _, entry := range logs {
+		total += logEntrySize(entry)
+	}
+	if total > maxLogBytes || logs[len(logs)-1].Message != "event-129" {
+		t.Fatalf("bounded logs bytes = %d, last = %#v", total, logs[len(logs)-1])
+	}
+	starter.mu.Lock()
+	starter.calls[0].process.stopSignals = true
+	starter.mu.Unlock()
+	_ = manager.Stop(context.Background(), snapshot.ID)
+}
+
+func TestStableRunRestoresReconnectBudget(t *testing.T) {
+	starter := &fakeStarter{ready: true}
+	manager := testManager(starter)
+	manager.retryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	manager.stableWindow = time.Minute
+	var clockMu sync.Mutex
+	clock := time.Unix(1_700_000_000, 0)
+	manager.now = func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return clock
+	}
+	snapshot, err := manager.Create(context.Background(), "server-a", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	starter.mu.Lock()
+	starter.calls[0].process.finish(errors.New("connection lost"), "connection reset")
+	starter.mu.Unlock()
+	waitForReconnectCount(t, manager, snapshot.ID, 1)
+	clockMu.Lock()
+	clock = clock.Add(time.Minute + time.Second)
+	clockMu.Unlock()
+	starter.mu.Lock()
+	starter.calls[1].process.finish(errors.New("connection lost"), "connection reset")
+	starter.mu.Unlock()
+	waitForReconnectCount(t, manager, snapshot.ID, 2)
+	manager.mu.Lock()
+	current := manager.byID[snapshot.ID]
+	manager.mu.Unlock()
+	current.mu.Lock()
+	failureAttempts := current.failureAttempts
+	current.mu.Unlock()
+	if failureAttempts != 1 {
+		t.Fatalf("failure attempts after stable run = %d, want 1", failureAttempts)
+	}
+	starter.mu.Lock()
+	starter.calls[2].process.stopSignals = true
+	starter.mu.Unlock()
+	_ = manager.Stop(context.Background(), snapshot.ID)
 }
 
 func TestStopHostAndCloseUsePreciseProcessesOnce(t *testing.T) {
@@ -368,6 +607,39 @@ func waitForStatus(t *testing.T, manager *Manager, id string, status Status) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("tunnel %s did not reach %s: %#v", id, status, manager.List())
+}
+
+func waitForReconnectCount(t *testing.T, manager *Manager, id string, count int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		for _, snapshot := range manager.List() {
+			if snapshot.ID == id && snapshot.Status == StatusRunning && snapshot.ReconnectCount == count {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("tunnel %s did not reach reconnect count %d: %#v", id, count, manager.List())
+}
+
+func waitForConnectWaiters(t *testing.T, manager *Manager, host string, count int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		flight := manager.connects[host]
+		waiters := 0
+		if flight != nil {
+			waiters = flight.waiters
+		}
+		manager.mu.Unlock()
+		if waiters == count {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("host %s did not reach %d connection waiters", host, count)
 }
 
 func assertTunnelError(t *testing.T, err error, code ErrorCode) {

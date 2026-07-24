@@ -14,13 +14,15 @@
 - Web 服务和本地转发端口只监听 `127.0.0.1`。
 - 远程端口探测优先执行 `ss -ltnp`，权限不足时退化为 `ss -ltn`。
 - 远程端口自动刷新按服务器启用，固定间隔 10 秒且默认关闭；失败保留上次成功结果。
+- 运行中的隧道意外退出后最多自动重连 5 次，退避为 1、2、4、8、16 秒；稳定运行满 60 秒后恢复重试额度，同一 Host 共享主连接恢复。
 - 默认远程目标地址为 `127.0.0.1`；第一版不要求用户处理复杂监听地址。
 - 程序退出或用户显式停止时关闭隧道；浏览器页面关闭不影响程序和隧道。
 
 ## 配置与秘密
 
 - 只读系统 `~/.ssh/config`，不直接修改该文件。
-- 普通偏好使用 XDG 配置目录保存。
+- 当前只保存每个 Host 的端口自动刷新偏好，路径为 `${XDG_CONFIG_HOME:-~/.config}/ssh-tunnel-manager/config.json`，目录权限 `0700`、文件权限 `0600`；启动时不得自动连接。
+- 隧道事件和脱敏 SSH 诊断只在内存中有界保留，停止隧道或退出程序后清除，不写磁盘。
 - 密码和私钥口令使用 Linux Secret Service / GNOME Keyring 持久化，禁止明文落盘和写日志。
 - 控制台只允许本机访问，并使用进程启动时生成的随机令牌。
 
@@ -35,7 +37,7 @@ go build ./cmd/ssh-tunnel-manager
 
 ## 当前目录与运行约定
 
-- cmd/ssh-tunnel-manager/main.go 是当前唯一可执行入口；internal/credential 负责 Secret Service，internal/ssh 负责 OpenSSH ControlMaster 生命周期和受控远程命令，internal/portdiscovery 负责 `ss` 解析、端口快照与自动刷新，internal/tunnel 负责回环端口分配、隧道状态与精确进程清理，internal/sshconfig 负责 SSH 配置解析，internal/web 负责本地页面和 API；docs/ 保存产品、架构和路线文档。
+- cmd/ssh-tunnel-manager/main.go 是当前唯一可执行入口；internal/credential 负责 Secret Service，internal/ssh 负责 OpenSSH ControlMaster 生命周期和受控远程命令，internal/portdiscovery 负责 `ss` 解析、端口快照与自动刷新，internal/preference 负责 XDG 非敏感偏好，internal/tunnel 负责回环端口分配、自动重连、隧道状态和精确进程清理，internal/sshconfig 负责 SSH 配置解析，internal/web 负责本地页面和 API；docs/ 保存产品、架构和路线文档。
 - 本地开发使用 go run ./cmd/ssh-tunnel-manager，默认控制台地址为 127.0.0.1:8765；构建使用 go build -o ssh-tunnel-manager ./cmd/ssh-tunnel-manager。
 - 测试文件与对应 Go 包同目录；涉及并发连接、端口刷新或生命周期的变更必须运行 `go test -race ./...`，并继续运行 `go vet ./...` 和构建命令。
 - 当前部署是直接运行单文件 Linux 可执行程序，没有安装脚本、systemd 单元或容器暴露配置；不得通过部署配置把回环服务暴露到局域网或公网。

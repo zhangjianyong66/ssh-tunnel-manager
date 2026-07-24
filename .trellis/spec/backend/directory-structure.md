@@ -7,10 +7,11 @@
     cmd/ssh-tunnel-manager/main.go  可执行程序入口、HTTP 路由和 MVP 页面
     internal/credential/            Secret Service 凭据接口和 D-Bus 适配器
     internal/portdiscovery/         ss 输出解析、端口快照和自动刷新生命周期
+    internal/preference/            XDG 非敏感自动刷新偏好
     internal/ssh/                   OpenSSH ControlMaster、askpass 和连接状态
     internal/sshconfig/             OpenSSH 配置、Include 和显式 Host 解析
-    internal/tunnel/                回环端口分配、隧道状态和精确进程清理
-    internal/web/                   本地控制台页面和 M1/M2/M3 HTTP API
+    internal/tunnel/                回环端口分配、自动重连、隧道状态和精确进程清理
+    internal/web/                   本地控制台页面和 MVP HTTP API
     docs/                           产品、架构和开发路线文档
     go.mod                          Go 模块定义（Go 1.22）
     .trellis/spec/backend/          后端代码规范
@@ -21,7 +22,7 @@
 - 可复用但不希望被外部模块导入的实现放在 internal/<包名>/；不要把业务代码塞回 cmd 入口文件。
 - 产品边界、架构决策和路线图放在 docs/，不在代码注释中复制整篇设计文档。
 - 测试文件与被测 Go 包放在同一目录，使用 <name>_test.go。
-- 不创建数据库目录、迁移目录或 ORM 层，除非未来需求明确引入持久化实现。
+- 非敏感偏好使用 `internal/preference` 的版本化 JSON 文件；不创建数据库目录、迁移目录或 ORM 层，除非未来需求明确引入其他持久化实现。
 
 ## 命名与边界
 
@@ -38,4 +39,4 @@
 ## 常见错误
 
 - 不要在仓库根目录新增第二个 main.go 或把可执行逻辑放入 internal/。
-- 不要因为路线图提到数据库就预先添加 ORM、迁移或 SQLite 代码；当前偏好配置和凭据存储尚未实现。
+- 不要为自动刷新偏好引入 ORM、迁移或 SQLite；当前文件存储已经覆盖所需范围，凭据仍由 Secret Service 独立保存。

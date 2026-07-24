@@ -25,7 +25,8 @@ const pageHTML = `<!doctype html>
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; padding: 11px 8px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }
     .hosts-table { min-width: 620px; }
-    .tunnel-table { min-width: 720px; }
+    .tunnel-table { min-width: 760px; }
+    .tunnels-section > .table-scroll > .tunnel-table { min-width: 980px; }
     .status, .port-number, .address { font-family: ui-monospace, monospace; }
     .address { color: #115e59; }
     .error { color: #b91c1c; white-space: pre-wrap; }
@@ -40,7 +41,15 @@ const pageHTML = `<!doctype html>
     .tunnel-status { font-family: ui-monospace, monospace; font-weight: 600; }
     .tunnel-status[data-status="running"] { color: #047857; }
     .tunnel-status[data-status="failed"] { color: #b91c1c; }
-    .tunnel-status[data-status="starting"], .tunnel-status[data-status="stopping"] { color: #a16207; }
+    .tunnel-status[data-status="starting"], .tunnel-status[data-status="stopping"], .tunnel-status[data-status="waiting_reconnect"], .tunnel-status[data-status="reconnecting"] { color: #a16207; }
+    .runtime, .reconnect-count { white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .retry-time { display: block; margin-top: 4px; color: #6b7280; font-size: 13px; white-space: nowrap; }
+    .log-row > td { padding: 0 8px 14px; background: #f8fafc; }
+    .tunnel-log { border-left: 3px solid #64748b; padding: 8px 12px; }
+    .log-entry { display: grid; grid-template-columns: 82px 64px minmax(180px, 1fr); gap: 10px; padding: 6px 0; border-bottom: 1px solid #e5e7eb; }
+    .log-entry:last-child { border-bottom: 0; }
+    .log-time, .log-level { color: #475569; font-family: ui-monospace, monospace; font-size: 12px; }
+    .log-diagnostic { grid-column: 3; margin: 2px 0 0; color: #475569; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
     dialog { border: 1px solid #cbd5e1; border-radius: 8px; padding: 20px; width: min(420px, calc(100vw - 40px)); }
     dialog::backdrop { background: rgb(15 23 42 / 35%); }
     dialog label { display: block; margin: 12px 0; }
@@ -59,6 +68,7 @@ const pageHTML = `<!doctype html>
       .port-toolbar { align-items: flex-start; }
       .port-toolbar strong { width: 100%; }
       .actions { min-width: 148px; }
+      .log-entry { grid-template-columns: 72px 58px minmax(150px, 1fr); gap: 6px; }
     }
   </style>
 </head>
@@ -82,8 +92,8 @@ const pageHTML = `<!doctype html>
     <h2 id="tunnels-title">活动隧道</h2>
     <div class="table-scroll">
       <table class="tunnel-table">
-        <thead><tr><th>Host</th><th>远程端口</th><th>本地映射</th><th>状态</th><th>操作</th></tr></thead>
-        <tbody id="tunnels"><tr><td colspan="5">加载中...</td></tr></tbody>
+        <thead><tr><th>Host</th><th>远程端口</th><th>本地映射</th><th>状态</th><th>运行时长</th><th>重连</th><th>操作</th></tr></thead>
+        <tbody id="tunnels"><tr><td colspan="7">加载中...</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -104,6 +114,9 @@ const pageHTML = `<!doctype html>
     const error = document.getElementById('error');
     const credentialDialog = document.getElementById('credential-dialog');
     const busyTargets = new Set();
+    const expandedLogs = new Set();
+    const tunnelLogs = new Map();
+    let currentTunnels = [];
     let loading = false;
     let reloadPending = false;
 
@@ -135,7 +148,24 @@ const pageHTML = `<!doctype html>
     }
 
     function tunnelStatus(status) {
-      return ({ starting: '启动中', running: '运行中', stopping: '停止中', failed: '失败' })[status] || status || '未知';
+      return ({ starting: '启动中', running: '运行中', waiting_reconnect: '等待重连', reconnecting: '正在重连', stopping: '停止中', failed: '需要处理' })[status] || status || '未知';
+    }
+
+    function formatDuration(startedAt) {
+      if (!startedAt) return '—';
+      const seconds = Math.max(0, Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000));
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const rest = seconds % 60;
+      if (hours) return hours + ' 小时 ' + minutes + ' 分';
+      if (minutes) return minutes + ' 分 ' + rest + ' 秒';
+      return rest + ' 秒';
+    }
+
+    function retryText(nextRetryAt) {
+      if (!nextRetryAt) return '';
+      const seconds = Math.max(0, Math.ceil((new Date(nextRetryAt).getTime() - Date.now()) / 1000));
+      return seconds > 0 ? seconds + ' 秒后重试' : '即将重试';
     }
 
     function setBusy(key, active, label) {
@@ -215,7 +245,68 @@ const pageHTML = `<!doctype html>
       window.open('http://' + address + '/', '_blank', 'noopener,noreferrer');
     }
 
-    function tunnelActions(item) {
+    async function loadTunnelLogs(id) {
+      try {
+        const response = await fetch('/api/tunnels/' + encodeURIComponent(id) + '/logs');
+        const result = await responseJSON(response);
+        if (!response.ok) throw result;
+        tunnelLogs.set(id, { logs: result.logs || [] });
+      } catch (value) {
+        tunnelLogs.set(id, { error: value && value.message ? value.message : '日志加载失败', logs: [] });
+      }
+    }
+
+    async function toggleTunnelLogs(item) {
+      if (expandedLogs.has(item.id)) {
+        expandedLogs.delete(item.id);
+      } else {
+        expandedLogs.add(item.id);
+        await loadTunnelLogs(item.id);
+      }
+      renderTunnels(currentTunnels);
+    }
+
+    function logPanel(item) {
+      const panel = document.createElement('div');
+      panel.className = 'tunnel-log';
+      const state = tunnelLogs.get(item.id) || { logs: [] };
+      if (state.error) {
+        const notice = document.createElement('p');
+        notice.className = 'error';
+        notice.textContent = state.error;
+        panel.appendChild(notice);
+      }
+      for (const entry of state.logs) {
+        const row = document.createElement('div');
+        row.className = 'log-entry';
+        const time = document.createElement('time');
+        time.className = 'log-time';
+        time.dateTime = entry.time || '';
+        time.textContent = entry.time ? new Date(entry.time).toLocaleTimeString() : '—';
+        const level = document.createElement('span');
+        level.className = 'log-level';
+        level.textContent = ({ info: '信息', warning: '警告', error: '错误' })[entry.level] || entry.level || '信息';
+        const content = document.createElement('span');
+        content.textContent = entry.message || '';
+        row.append(time, level, content);
+        if (entry.diagnostic) {
+          const diagnostic = document.createElement('pre');
+          diagnostic.className = 'log-diagnostic';
+          diagnostic.textContent = entry.diagnostic;
+          row.appendChild(diagnostic);
+        }
+        panel.appendChild(row);
+      }
+      if (!state.error && state.logs.length === 0) {
+        const empty = document.createElement('span');
+        empty.className = 'muted';
+        empty.textContent = '暂无日志';
+        panel.appendChild(empty);
+      }
+      return panel;
+    }
+
+    function tunnelActions(item, showLogs = true) {
       const actions = document.createElement('div');
       actions.className = 'actions';
       const key = tunnelKey(item.host, item.remotePort);
@@ -240,6 +331,15 @@ const pageHTML = `<!doctype html>
         pending.textContent = tunnelStatus(item.status);
         pending.disabled = true;
         actions.appendChild(pending);
+        if (item.status !== 'stopping') actions.appendChild(actionButton('停止', key, () => stopTunnel(item), 'danger'));
+      }
+      if (showLogs) {
+        const logs = document.createElement('button');
+        logs.type = 'button';
+        logs.textContent = expandedLogs.has(item.id) ? '收起日志' : '日志';
+        logs.setAttribute('aria-expanded', expandedLogs.has(item.id) ? 'true' : 'false');
+        logs.onclick = () => toggleTunnelLogs(item);
+        actions.appendChild(logs);
       }
       return actions;
     }
@@ -270,6 +370,12 @@ const pageHTML = `<!doctype html>
       status.dataset.status = item.status;
       status.textContent = tunnelStatus(item.status);
       cell.appendChild(status);
+      if (item.status === 'waiting_reconnect' && item.nextRetryAt) {
+        const retry = document.createElement('span');
+        retry.className = 'retry-time';
+        retry.textContent = retryText(item.nextRetryAt);
+        cell.appendChild(retry);
+      }
       if (item.lastError && item.lastError.message) {
         const detail = document.createElement('span');
         detail.className = 'inline-error';
@@ -280,6 +386,7 @@ const pageHTML = `<!doctype html>
     }
 
     function renderTunnels(items) {
+      currentTunnels = items;
       tunnels.innerHTML = '';
       for (const item of items) {
         const row = document.createElement('tr');
@@ -290,13 +397,28 @@ const pageHTML = `<!doctype html>
         remote.textContent = String(item.remotePort);
         const actions = document.createElement('td');
         actions.appendChild(tunnelActions(item));
-        row.append(host, remote, mappingCell(item), statusCell(item, ''), actions);
+        const runtime = document.createElement('td');
+        runtime.className = 'runtime';
+        runtime.textContent = item.status === 'running' ? formatDuration(item.runningSince) : '—';
+        const reconnects = document.createElement('td');
+        reconnects.className = 'reconnect-count';
+        reconnects.textContent = String(item.reconnectCount || 0);
+        row.append(host, remote, mappingCell(item), statusCell(item, ''), runtime, reconnects, actions);
         tunnels.appendChild(row);
+        if (expandedLogs.has(item.id)) {
+          const logRow = document.createElement('tr');
+          logRow.className = 'log-row';
+          const logCell = document.createElement('td');
+          logCell.colSpan = 7;
+          logCell.appendChild(logPanel(item));
+          logRow.appendChild(logCell);
+          tunnels.appendChild(logRow);
+        }
       }
       if (items.length === 0) {
         const row = document.createElement('tr');
         const empty = document.createElement('td');
-        empty.colSpan = 5;
+        empty.colSpan = 7;
         empty.className = 'muted';
         empty.textContent = '暂无隧道';
         row.appendChild(empty);
@@ -376,7 +498,7 @@ const pageHTML = `<!doctype html>
         process.textContent = port.process || '不可见';
         const actions = document.createElement('td');
         if (item) {
-          actions.appendChild(tunnelActions(item));
+          actions.appendChild(tunnelActions(item, false));
         } else {
           const key = tunnelKey(host, port.number);
           actions.appendChild(actionButton('代理', key, () => createTunnel(host, port.number)));
@@ -411,6 +533,14 @@ const pageHTML = `<!doctype html>
       if (!hostsResponse.ok) throw hostData;
       if (!tunnelResponse.ok) throw tunnelData;
       const tunnelItems = tunnelData.tunnels || [];
+      const tunnelIDs = new Set(tunnelItems.map(item => item.id));
+      for (const id of [...expandedLogs]) {
+        if (!tunnelIDs.has(id)) {
+          expandedLogs.delete(id);
+          tunnelLogs.delete(id);
+        }
+      }
+      await Promise.all([...expandedLogs].map(id => loadTunnelLogs(id)));
       const tunnelByTarget = new Map(tunnelItems.map(item => [tunnelKey(item.host, item.remotePort), item]));
       renderTunnels(tunnelItems);
       hosts.innerHTML = '';

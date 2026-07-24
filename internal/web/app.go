@@ -36,28 +36,35 @@ type portDiscovery interface {
 type tunnelService interface {
 	Create(context.Context, string, uint16) (tunnel.Snapshot, error)
 	List() []tunnel.Snapshot
+	Logs(string) ([]tunnel.LogEntry, bool)
 	Stop(context.Context, string) error
 	StopHost(context.Context, string) error
 }
 
+type preferenceStore interface {
+	AutoRefresh(string) (bool, error)
+	SetAutoRefresh(string, bool) error
+}
+
 // App owns the SSH configuration snapshot and control-page HTTP handlers.
 type App struct {
-	mu         sync.RWMutex
-	config     sshconfig.Config
-	configPath string
-	loader     configLoader
-	sessions   sessionManager
-	ports      portDiscovery
-	tunnels    tunnelService
-	handler    http.Handler
+	mu          sync.RWMutex
+	config      sshconfig.Config
+	configPath  string
+	loader      configLoader
+	sessions    sessionManager
+	ports       portDiscovery
+	tunnels     tunnelService
+	preferences preferenceStore
+	handler     http.Handler
 }
 
 // NewApp loads the initial SSH config and creates the control-page handler.
-func NewApp(configPath string, sessions sessionManager, ports portDiscovery, tunnels tunnelService) (*App, error) {
-	return newApp(configPath, sshconfig.Loader{}, sessions, ports, tunnels)
+func NewApp(configPath string, sessions sessionManager, ports portDiscovery, tunnels tunnelService, preferences ...preferenceStore) (*App, error) {
+	return newApp(configPath, sshconfig.Loader{}, sessions, ports, tunnels, preferences...)
 }
 
-func newApp(configPath string, loader configLoader, sessions sessionManager, ports portDiscovery, tunnels tunnelService) (*App, error) {
+func newApp(configPath string, loader configLoader, sessions sessionManager, ports portDiscovery, tunnels tunnelService, preferences ...preferenceStore) (*App, error) {
 	if sessions == nil {
 		return nil, errors.New("SSH 会话管理器不能为空")
 	}
@@ -68,6 +75,9 @@ func newApp(configPath string, loader configLoader, sessions sessionManager, por
 		return nil, errors.New("隧道服务不能为空")
 	}
 	app := &App{configPath: configPath, loader: loader, sessions: sessions, ports: ports, tunnels: tunnels}
+	if len(preferences) > 0 {
+		app.preferences = preferences[0]
+	}
 	if err := app.refresh(); err != nil {
 		return nil, err
 	}
@@ -83,6 +93,7 @@ func newApp(configPath string, loader configLoader, sessions sessionManager, por
 	mux.HandleFunc("PUT /api/servers/{host}/ports/auto-refresh", app.handleAutoRefresh)
 	mux.HandleFunc("POST /api/tunnels", app.handleCreateTunnel)
 	mux.HandleFunc("GET /api/tunnels", app.handleTunnels)
+	mux.HandleFunc("GET /api/tunnels/{id}/logs", app.handleTunnelLogs)
 	mux.HandleFunc("DELETE /api/tunnels/{id}", app.handleStopTunnel)
 	app.handler = mux
 	return app, nil
@@ -184,6 +195,11 @@ func (a *App) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "connect_failed", "启动 SSH 连接失败")
 		return
 	}
+	if a.preferences != nil {
+		if enabled, preferenceErr := a.preferences.AutoRefresh(host); preferenceErr == nil && enabled {
+			_, _ = a.ports.SetAutoRefresh(host, true)
+		}
+	}
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
@@ -254,6 +270,20 @@ func (a *App) handleStopTunnel(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (a *App) handleTunnelLogs(w http.ResponseWriter, r *http.Request) {
+	logs, ok := a.tunnels.Logs(r.PathValue("id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "tunnel_not_found", "SSH 隧道不存在")
+		return
+	}
+	if logs == nil {
+		logs = []tunnel.LogEntry{}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Logs []tunnel.LogEntry `json:"logs"`
+	}{Logs: logs})
+}
+
 func (a *App) handlePorts(w http.ResponseWriter, r *http.Request) {
 	if !a.requireHost(w, r.PathValue("host")) {
 		return
@@ -298,6 +328,12 @@ func (a *App) handleAutoRefresh(w http.ResponseWriter, r *http.Request) {
 	if a.sessions.Snapshot(host).Status != sshmanager.StatusConnected {
 		writeError(w, http.StatusConflict, string(portdiscovery.ErrorServerNotConnected), "SSH 服务器尚未连接")
 		return
+	}
+	if a.preferences != nil {
+		if err := a.preferences.SetAutoRefresh(host, *request.Enabled); err != nil {
+			writeError(w, http.StatusInternalServerError, "preference_write_failed", "保存自动刷新设置失败")
+			return
+		}
 	}
 	snapshot, err := a.ports.SetAutoRefresh(host, *request.Enabled)
 	if err != nil {

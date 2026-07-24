@@ -10,9 +10,9 @@
 ## OpenSSH 与隧道
 
 - 系统 ssh 是唯一 SSH 协议实现，必须复用用户现有 OpenSSH 配置能力。
-- M3 端口转发复用既有 ControlMaster，参数应等价于 `ssh -S <control-path> -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -L 127.0.0.1:<local>:127.0.0.1:<remote> -- <host-alias>`，实际执行必须使用参数数组。Keepalive 与自动重连策略属于 M4，需在主连接层单独设计。
+- 端口转发复用既有 ControlMaster，参数应等价于 `ssh -S <control-path> -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -L 127.0.0.1:<local>:127.0.0.1:<remote> -- <host-alias>`，实际执行必须使用参数数组。自动重连由 `internal/tunnel` 按 Host 协调既有 SSH Manager，不新增独立 SSH 协议或无限 Keepalive 循环。
 - 每个连接和隧道由明确句柄管理；禁止用全局进程名匹配停止其他 SSH 会话。
-- SSH 断开后的自动重连应有界并记录状态；不得因一个隧道故障退出整个 Web 服务。
+- SSH 断开后的自动重连固定最多 5 次并记录状态；认证、主机密钥、配置、依赖和交互凭据错误立即转人工处理，不得因一个隧道故障退出整个 Web 服务。
 
 ## HTTP 与生命周期
 

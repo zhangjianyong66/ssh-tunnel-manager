@@ -19,6 +19,7 @@ import (
 
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/credential"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/portdiscovery"
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/preference"
 	sshmanager "github.com/zhangjianyong66/ssh-tunnel-manager/internal/ssh"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/tunnel"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/web"
@@ -52,9 +53,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("初始化端口发现服务失败: %v", err)
 	}
-	tunnels := tunnel.NewManager(manager)
+	tunnels := tunnel.NewManager(manager, manager)
+	var preferences preference.Store
+	preferencePath, preferencePathErr := preference.DefaultPath()
+	if preferencePathErr != nil {
+		log.Printf("获取偏好设置路径失败，已使用进程内默认值: %v", preferencePathErr)
+	} else {
+		store, loadErr := preference.NewFileStore(preferencePath)
+		preferences = store
+		if loadErr != nil {
+			log.Printf("读取偏好设置失败，已使用默认值: %v", loadErr)
+		}
+	}
 	configPath := filepath.Join(userHomeDir(), ".ssh", "config")
-	app, err := web.NewApp(configPath, manager, discovery, tunnels)
+	app, err := web.NewApp(configPath, manager, discovery, tunnels, preferences)
 	if err != nil {
 		log.Fatalf("初始化 Web 控制台失败: %v", err)
 	}

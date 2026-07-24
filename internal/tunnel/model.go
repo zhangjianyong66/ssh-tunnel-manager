@@ -3,6 +3,7 @@ package tunnel
 
 import (
 	"context"
+	"time"
 
 	sshmanager "github.com/zhangjianyong66/ssh-tunnel-manager/internal/ssh"
 )
@@ -11,10 +12,12 @@ import (
 type Status string
 
 const (
-	StatusStarting Status = "starting"
-	StatusRunning  Status = "running"
-	StatusStopping Status = "stopping"
-	StatusFailed   Status = "failed"
+	StatusStarting         Status = "starting"
+	StatusRunning          Status = "running"
+	StatusWaitingReconnect Status = "waiting_reconnect"
+	StatusReconnecting     Status = "reconnecting"
+	StatusStopping         Status = "stopping"
+	StatusFailed           Status = "failed"
 )
 
 // ErrorCode is a stable tunnel failure classification.
@@ -45,16 +48,33 @@ func (e *Error) Error() string {
 
 // Snapshot is a process-free representation of a tunnel.
 type Snapshot struct {
-	ID         string `json:"id"`
-	Host       string `json:"host"`
-	RemotePort uint16 `json:"remotePort"`
-	LocalPort  uint16 `json:"localPort,omitempty"`
-	Address    string `json:"address,omitempty"`
-	Status     Status `json:"status"`
-	LastError  *Error `json:"lastError,omitempty"`
+	ID             string     `json:"id"`
+	Host           string     `json:"host"`
+	RemotePort     uint16     `json:"remotePort"`
+	LocalPort      uint16     `json:"localPort,omitempty"`
+	Address        string     `json:"address,omitempty"`
+	Status         Status     `json:"status"`
+	RunningSince   *time.Time `json:"runningSince,omitempty"`
+	ReconnectCount int        `json:"reconnectCount"`
+	NextRetryAt    *time.Time `json:"nextRetryAt,omitempty"`
+	LastError      *Error     `json:"lastError,omitempty"`
+}
+
+// LogEntry is one bounded, already-sanitized tunnel lifecycle event.
+type LogEntry struct {
+	Time       time.Time `json:"time"`
+	Level      string    `json:"level"`
+	Message    string    `json:"message"`
+	Diagnostic string    `json:"diagnostic,omitempty"`
 }
 
 // Starter creates a forwarding process through an existing SSH master.
 type Starter interface {
 	StartLocalForward(context.Context, string, uint16, uint16) (sshmanager.Process, error)
+}
+
+// Connector restores and observes the ControlMaster used by tunnel retries.
+type Connector interface {
+	Snapshot(string) sshmanager.Snapshot
+	Connect(context.Context, string, sshmanager.ConnectOptions) (sshmanager.Snapshot, error)
 }

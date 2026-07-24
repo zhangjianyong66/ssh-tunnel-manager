@@ -6,33 +6,35 @@
 
 - 触发范围：修改 `internal/ssh.Manager.StartLocalForward`、`internal/tunnel`、隧道 HTTP API、控制台隧道操作、Host 断开或程序退出顺序。
 - 目标：通过系统 OpenSSH 和既有 ControlMaster 创建仅监听 `127.0.0.1` 的精确可管理转发，同时保证端口分配、并发幂等、错误脱敏和进程清理可验证。
-- M3 只负责基础 `starting`、`running`、`stopping`、`failed` 状态；自动重连、退避、运行时长、重连次数和日志属于 M4。
+- M4 在 M3 生命周期上增加自动重连、时间、累计次数和日志；具体契约见 `reliability-and-preferences.md`。
 
 ### 2. Signatures
 
 - SSH 转发：`Manager.StartLocalForward(ctx context.Context, host string, localPort, remotePort uint16) (Process, error)`。
 - 隧道管理：
-  - `tunnel.NewManager(starter tunnel.Starter) *tunnel.Manager`
+  - `tunnel.NewManager(starter tunnel.Starter, connectors ...tunnel.Connector) *tunnel.Manager`
   - `Manager.Create(context.Context, string, uint16) (tunnel.Snapshot, error)`
   - `Manager.List() []tunnel.Snapshot`
+  - `Manager.Logs(string) ([]tunnel.LogEntry, bool)`
   - `Manager.Stop(context.Context, string) error`
   - `Manager.StopHost(context.Context, string) error`
   - `Manager.Close(context.Context) error`
 - HTTP：
   - `POST /api/tunnels`
   - `GET /api/tunnels`
+  - `GET /api/tunnels/{id}/logs`
   - `DELETE /api/tunnels/{id}`
 
 ### 3. Contracts
 
 - `POST` 请求严格为 `{ "host": string, "remotePort": int }`，正文最多 4 KiB；拒绝未知字段、尾随 JSON、空 Host、缺失端口和 `1..65535` 之外的端口。
-- `Snapshot` 只包含 `id`、`host`、`remotePort`、可选 `localPort`/`address`、`status` 和可选安全 `lastError`。不得包含 ControlPath、PID、进程对象或原始 SSH 输出。
+- `Snapshot` 包含 `id`、`host`、`remotePort`、可选 `localPort`/`address`、`status`、可选 `runningSince`/`nextRetryAt`、`reconnectCount` 和可选安全 `lastError`。不得包含 ControlPath、PID、进程对象或原始 SSH 输出。
 - SSH 参数固定为数组：`ssh -S <control-path> -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -L 127.0.0.1:<local>:127.0.0.1:<remote> -- <host>`。转发前后都执行 `ssh -S <control-path> -O check <host>`；后置检查失败时精确清理已启动进程。
 - 本地端口先尝试远程同号，只用 `tcp4` 和 `127.0.0.1` 预检；冲突时申请其他回环端口。进程内预留集合防止并发重复分配，预检与 OpenSSH 绑定之间的外部竞争最多有界重试 5 次。
 - `host + remotePort` 是幂等键。同目标并发创建共用一个条目锁并返回同一随机 ID；不同目标不得共享长时间全局锁。
 - API 只有在本地监听探测成功且转发进程未退出后才返回 `running`。探测只确认本地 SSH 监听，不保证最终远程服务接受连接。
 - 每个转发进程只有 `watchProcess` 创建的监控 goroutine 调用一次 `Wait`。停止只对保存的句柄发送 `os.Interrupt`，有界等待后升级为 `os.Kill`；Go 1.22 中复用停止计时器前必须 `Stop` 并按需排空通道。
-- 意外退出转为 `failed` 并保留条目；再次 `Create` 在相同 ID 上重建。`Stop` 对未知 ID 幂等成功，成功停止后从索引移除并释放端口。
+- 意外退出保留相同 ID 并进入 M4 有界自动重连；最终 `failed` 后再次 `Create` 在相同 ID 上手动重建。`Stop` 对未知 ID 幂等成功，成功停止后从索引移除并释放端口。
 - 显式断开顺序为 `StopHost -> SetAutoRefresh(false) -> SSH Disconnect`，即使隧道停止失败也继续后两步。程序退出顺序为 `tunnels.Close -> discovery.Close -> SSH Close -> HTTP Shutdown`。
 - 页面每轮只调用一次 `GET /api/tunnels`，按 Host 和远程端口映射到端口表并同时渲染独立总览；页面刷新、关闭和 `pagehide` 不调用停止 API。
 

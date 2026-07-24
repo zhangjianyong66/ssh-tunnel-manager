@@ -195,13 +195,17 @@ func (b *limitedBuffer) String() string {
 }
 
 type realProcess struct {
-	cmd    *exec.Cmd
-	stderr *limitedBuffer
+	cmd     *exec.Cmd
+	stderr  *limitedBuffer
+	secrets []string
 }
 
 func (p *realProcess) Wait() error                { return p.cmd.Wait() }
 func (p *realProcess) Signal(sig os.Signal) error { return p.cmd.Process.Signal(sig) }
-func (p *realProcess) Diagnostics() string        { return p.stderr.String() }
+func (p *realProcess) Diagnostics() string {
+	values := append([]string{p.stderr.String()}, p.secrets...)
+	return sanitizeDiagnostic(values...)
+}
 
 // ConnectOptions supplies one-shot authentication input. Values are kept only
 // in this call and are never copied into command arguments or environment.
@@ -236,6 +240,7 @@ type session struct {
 	connectedAt time.Time
 	lastError   *Error
 	diagnostic  string
+	username    string
 }
 
 // Manager owns all SSH processes started by the application.
@@ -309,6 +314,12 @@ func (m *Manager) Connect(ctx context.Context, host string, opts ConnectOptions)
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	s.mu.Lock()
+	if opts.Username == "" {
+		opts.Username = s.username
+	}
+	if opts.Username != "" {
+		s.username = opts.Username
+	}
 	if s.status == StatusConnected || s.status == StatusConnecting {
 		snap := s.snapshot()
 		s.mu.Unlock()
@@ -516,6 +527,9 @@ func (m *Manager) StartLocalForward(ctx context.Context, host string, localPort,
 		stopUnownedProcess(process)
 		return nil, &Error{Code: ErrorNotConnected, Message: "SSH 服务器主连接已断开"}
 	}
+	if real, ok := process.(*realProcess); ok {
+		real.secrets = []string{controlPath}
+	}
 	return process, nil
 }
 
@@ -618,7 +632,7 @@ func (m *Manager) monitor(s *session, password, passphrase string) {
 		s.askpass = nil
 		return
 	}
-	diagnostic := sanitizeDiagnostic(process.Diagnostics(), password, passphrase)
+	diagnostic := sanitizeDiagnostic(process.Diagnostics(), password, passphrase, s.controlPath)
 	if err == nil {
 		s.status = StatusFailed
 		s.diagnostic = diagnostic

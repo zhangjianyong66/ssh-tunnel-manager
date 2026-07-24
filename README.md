@@ -4,7 +4,7 @@ SSH 隧道管理器是一个运行在本地的 Go 单文件程序。它启动一
 
 ## 当前状态
 
-项目已完成 MVP 的端口转发与隧道管理阶段。目前已实现：
+项目已完成 MVP 的可靠性与控制台体验阶段。目前已实现：
 
 - Go 单文件程序入口；
 - 仅监听 `127.0.0.1` 的本地 Web 服务；
@@ -24,9 +24,13 @@ SSH 隧道管理器是一个运行在本地的 Go 单文件程序。它启动一
 - 同时管理多台服务器和多个远程端口，并对重复创建保持幂等；
 - 在控制台查看、复制、打开、重试和精确停止隧道；
 - 断开服务器或退出程序时按资源依赖顺序有界清理隧道；
+- 隧道意外退出后执行 1、2、4、8、16 秒的有界自动重连，同一 Host 共享一次主连接恢复；
+- 控制台显示连续运行时长、累计重连次数、等待重连和需要人工处理状态；
+- 每条隧道在内存中保留最多 100 条、总计不超过 64 KiB 的脱敏近期日志；
+- 按 Host 将端口自动刷新开关保存到 XDG 配置目录，程序重启后仍只在用户手动连接时恢复；
 - 产品、架构和路线文档。
 
-自动重连、运行时长、重连次数和脱敏原始日志将在 M4 实现，具体边界见 [docs/product-design.md](docs/product-design.md)。远程服务器需要提供 `ss` 命令。
+程序不会在重启后自动连接服务器或恢复隧道，诊断日志也不会写入磁盘。远程服务器需要提供 `ss` 命令。
 
 ## 开发运行
 
@@ -50,10 +54,11 @@ go build -o ssh-tunnel-manager ./cmd/ssh-tunnel-manager
 cmd/ssh-tunnel-manager/  可执行程序入口
 internal/credential/     Secret Service 凭据接口与适配器
 internal/portdiscovery/  远程 TCP 监听端口解析与刷新状态
+internal/preference/     XDG 非敏感偏好设置
 internal/ssh/            OpenSSH ControlMaster 连接管理
 internal/sshconfig/      SSH 配置与 Include 解析
-internal/tunnel/         本地端口分配与隧道生命周期
-internal/web/            本地控制台页面和 M1/M2/M3 API
+internal/tunnel/         本地端口分配、自动重连与隧道生命周期
+internal/web/            本地控制台页面和 MVP API
 docs/                    产品与技术文档
 go.mod                   Go 模块定义
 ```
