@@ -6,9 +6,10 @@
 
     cmd/ssh-tunnel-manager/main.go  可执行程序入口、HTTP 路由和 MVP 页面
     internal/credential/            Secret Service 凭据接口和 D-Bus 适配器
+    internal/portdiscovery/         ss 输出解析、端口快照和自动刷新生命周期
     internal/ssh/                   OpenSSH ControlMaster、askpass 和连接状态
     internal/sshconfig/             OpenSSH 配置、Include 和显式 Host 解析
-    internal/web/                   本地控制台页面和 M1 HTTP API
+    internal/web/                   本地控制台页面和 M1/M2 HTTP API
     docs/                           产品、架构和开发路线文档
     go.mod                          Go 模块定义（Go 1.22）
     .trellis/spec/backend/          后端代码规范
@@ -18,7 +19,7 @@
 - 可执行程序只放在 cmd/<program>/，入口包使用 package main。当前入口为 cmd/ssh-tunnel-manager/main.go。
 - 可复用但不希望被外部模块导入的实现放在 internal/<包名>/；不要把业务代码塞回 cmd 入口文件。
 - 产品边界、架构决策和路线图放在 docs/，不在代码注释中复制整篇设计文档。
-- 测试文件与被测 Go 包放在同一目录，使用 <name>_test.go；当前仓库尚未有测试文件。
+- 测试文件与被测 Go 包放在同一目录，使用 <name>_test.go。
 - 不创建数据库目录、迁移目录或 ORM 层，除非未来需求明确引入持久化实现。
 
 ## 命名与边界

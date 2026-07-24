@@ -21,11 +21,11 @@
 ## 测试与静态检查
 
     gofmt -w ./cmd ./internal
-    go test ./...
+    go test -race ./...
     go vet ./...
     go build ./cmd/ssh-tunnel-manager
 
-当前 MVP 尚未提交 _test.go 文件，因此 go test ./... 主要验证包可编译；新增认证、地址校验、端口解析、隧道生命周期等行为时，应在对应包补充单元测试。
+测试与被测 Go 包放在同一目录。连接管理、端口刷新和服务关闭包含并发状态，完整验证必须使用 `go test -race ./...`。
 
 ## 部署与数据目录
 

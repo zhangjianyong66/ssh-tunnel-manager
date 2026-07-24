@@ -10,6 +10,7 @@
 4. 涉及运行、交付或验证时，阅读 runtime-and-deployment.md 与 quality-guidelines.md。
 5. 修改后执行格式化、测试、静态检查和构建命令。
 6. 涉及 SSH 配置、认证、ControlMaster、M1 API 或 M2/M3 连接复用时，阅读 ssh-connection.md。
+7. 涉及远程 `ss`、端口快照、自动刷新或 M2 API 时，阅读 port-discovery.md。
 
 ## 规范索引
 
@@ -22,11 +23,12 @@
 | [logging-guidelines.md](./logging-guidelines.md) | 标准库日志和敏感信息脱敏 |
 | [project-conventions.md](./project-conventions.md) | 安全、OpenSSH、HTTP 生命周期及文档约定 |
 | [ssh-connection.md](./ssh-connection.md) | SSH Host、ControlMaster、askpass、Secret Service 和 M1 API 可执行契约 |
+| [port-discovery.md](./port-discovery.md) | 受控远程命令、ss 解析、刷新状态和 M2 API 可执行契约 |
 
 ## 质量检查
 
     gofmt -w ./cmd ./internal
-    go test ./...
+    go test -race ./...
     go vet ./...
     go build ./cmd/ssh-tunnel-manager
 

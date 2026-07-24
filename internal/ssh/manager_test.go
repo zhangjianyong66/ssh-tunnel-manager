@@ -29,12 +29,15 @@ func (p *fakeProcess) finish(err error, diagnostic string) {
 }
 
 type fakeRunner struct {
-	mu       sync.Mutex
-	specs    []CommandSpec
-	runs     []CommandSpec
-	process  *fakeProcess
-	startErr error
-	runErr   error
+	mu        sync.Mutex
+	specs     []CommandSpec
+	runs      []CommandSpec
+	outputs   []CommandSpec
+	process   *fakeProcess
+	startErr  error
+	runErr    error
+	result    CommandOutput
+	outputErr error
 }
 
 type multiProcessRunner struct {
@@ -89,6 +92,13 @@ func (r *fakeRunner) Run(_ context.Context, spec CommandSpec) error {
 	defer r.mu.Unlock()
 	r.runs = append(r.runs, spec)
 	return r.runErr
+}
+
+func (r *fakeRunner) Output(_ context.Context, spec CommandSpec) (CommandOutput, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.outputs = append(r.outputs, spec)
+	return r.result, r.outputErr
 }
 
 func TestManagerConnectDisconnectAndSecretIsolation(t *testing.T) {
@@ -208,6 +218,58 @@ func TestManagerManagesTwoServersIndependently(t *testing.T) {
 	}
 	if manager.Snapshot("server-b").Status != StatusDisconnected {
 		t.Fatalf("close did not stop server-b: %#v", manager.Snapshot("server-b"))
+	}
+}
+
+func TestManagerExecuteUsesConnectedControlMaster(t *testing.T) {
+	runner := &fakeRunner{process: newFakeProcess(), result: CommandOutput{Stdout: "LISTEN output"}}
+	manager, err := NewManager(runner, nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	connected, err := manager.Connect(context.Background(), "server-a", ConnectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := manager.Execute(context.Background(), "server-a", []string{"ss", "-ltnp"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Stdout != "LISTEN output" || len(runner.outputs) != 1 {
+		t.Fatalf("execute result = %#v, specs = %#v", result, runner.outputs)
+	}
+	want := []string{"-S", connected.ControlPath, "-T", "-o", "BatchMode=yes", "--", "server-a", "ss", "-ltnp"}
+	if got := runner.outputs[0].Args; strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _ = manager.Disconnect(ctx, "server-a")
+}
+
+func TestManagerExecuteRejectsDisconnectedAndInvalidCommand(t *testing.T) {
+	manager, err := NewManager(&fakeRunner{}, nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range [][]string{{"ss", "-ltn"}, nil, {"ss", "bad\x00value"}} {
+		_, executeErr := manager.Execute(context.Background(), "server-a", command)
+		var sshErr *Error
+		if !errors.As(executeErr, &sshErr) {
+			t.Fatalf("command %#v error = %#v", command, executeErr)
+		}
+	}
+}
+
+func TestLimitedBufferKeepsBoundedPrefix(t *testing.T) {
+	buffer := &limitedBuffer{limit: 4}
+	written, err := buffer.Write([]byte("abcdef"))
+	if err != nil || written != 6 || buffer.String() != "abcd" {
+		t.Fatalf("written = %d, value = %q, err = %v", written, buffer.String(), err)
+	}
+	written, err = buffer.Write([]byte("gh"))
+	if err != nil || written != 2 || buffer.String() != "abcd" {
+		t.Fatalf("second write = %d, value = %q, err = %v", written, buffer.String(), err)
 	}
 }
 

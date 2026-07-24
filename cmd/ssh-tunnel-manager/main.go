@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/credential"
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/portdiscovery"
 	sshmanager "github.com/zhangjianyong66/ssh-tunnel-manager/internal/ssh"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/web"
 )
@@ -46,8 +47,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("初始化 SSH 管理器失败: %v", err)
 	}
+	discovery, err := portdiscovery.NewService(manager)
+	if err != nil {
+		log.Fatalf("初始化端口发现服务失败: %v", err)
+	}
 	configPath := filepath.Join(userHomeDir(), ".ssh", "config")
-	app, err := web.NewApp(configPath, manager)
+	app, err := web.NewApp(configPath, manager, discovery)
 	if err != nil {
 		log.Fatalf("初始化 Web 控制台失败: %v", err)
 	}
@@ -80,6 +85,9 @@ func main() {
 	}
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if err := discovery.Close(); err != nil {
+		log.Printf("停止端口发现服务失败: %v", err)
+	}
 	if err := manager.Close(shutdownContext); err != nil {
 		log.Printf("清理 SSH 连接失败: %v", err)
 	}

@@ -31,6 +31,8 @@ const (
 
 const controlMasterReadyTimeout = 15 * time.Second
 
+const commandOutputLimit = 1 << 20
+
 // ErrorCode is a stable classification for API consumers.
 type ErrorCode string
 
@@ -44,6 +46,7 @@ const (
 	ErrorDependency         ErrorCode = "local_dependency_missing"
 	ErrorCancelled          ErrorCode = "user_cancelled"
 	ErrorProcess            ErrorCode = "process_failed"
+	ErrorNotConnected       ErrorCode = "server_not_connected"
 )
 
 // Error is a user-safe SSH failure with an optional redacted diagnostic.
@@ -83,6 +86,16 @@ type Runner interface {
 
 type oneShotRunner interface {
 	Run(context.Context, CommandSpec) error
+}
+
+type outputRunner interface {
+	Output(context.Context, CommandSpec) (CommandOutput, error)
+}
+
+// CommandOutput contains bounded output from one SSH command.
+type CommandOutput struct {
+	Stdout string
+	Stderr string
 }
 
 // RealRunner starts the system ssh binary.
@@ -129,6 +142,48 @@ func (r RealRunner) Run(ctx context.Context, spec CommandSpec) error {
 	cmd.ExtraFiles = spec.ExtraFiles
 	return cmd.Run()
 }
+
+// Output runs one command and captures at most commandOutputLimit bytes from
+// each output stream.
+func (r RealRunner) Output(ctx context.Context, spec CommandSpec) (CommandOutput, error) {
+	binary := r.Binary
+	if binary == "" {
+		binary = spec.Binary
+	}
+	if binary == "" {
+		binary = "ssh"
+	}
+	cmd := exec.CommandContext(ctx, binary, spec.Args...)
+	cmd.Env = append(os.Environ(), spec.Env...)
+	cmd.Dir = spec.Dir
+	cmd.Stdin = nil
+	stdout := &limitedBuffer{limit: commandOutputLimit}
+	stderr := &limitedBuffer{limit: commandOutputLimit}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	cmd.ExtraFiles = spec.ExtraFiles
+	err := cmd.Run()
+	return CommandOutput{Stdout: stdout.String(), Stderr: stderr.String()}, err
+}
+
+type limitedBuffer struct {
+	buffer bytes.Buffer
+	limit  int
+}
+
+func (b *limitedBuffer) Write(value []byte) (int, error) {
+	written := len(value)
+	remaining := b.limit - b.buffer.Len()
+	if remaining > 0 {
+		if len(value) > remaining {
+			value = value[:remaining]
+		}
+		_, _ = b.buffer.Write(value)
+	}
+	return written, nil
+}
+
+func (b *limitedBuffer) String() string { return b.buffer.String() }
 
 type realProcess struct {
 	cmd    *exec.Cmd
@@ -349,6 +404,48 @@ func (m *Manager) Disconnect(ctx context.Context, host string) (Snapshot, error)
 	return m.Snapshot(host), nil
 }
 
+// Execute runs a remote command through host's connected ControlMaster. The
+// command is passed as an argument vector and is cancelled with ctx.
+func (m *Manager) Execute(ctx context.Context, host string, command []string) (CommandOutput, error) {
+	if err := validateHost(host); err != nil {
+		return CommandOutput{}, &Error{Code: ErrorConfiguration, Message: err.Error()}
+	}
+	if err := validateRemoteCommand(command); err != nil {
+		return CommandOutput{}, &Error{Code: ErrorConfiguration, Message: err.Error()}
+	}
+	m.mu.RLock()
+	s := m.sessions[host]
+	m.mu.RUnlock()
+	if s == nil {
+		return CommandOutput{}, &Error{Code: ErrorNotConnected, Message: "SSH 服务器尚未连接"}
+	}
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	s.mu.Lock()
+	status, controlPath := s.status, s.controlPath
+	s.mu.Unlock()
+	if status != StatusConnected || controlPath == "" {
+		return CommandOutput{}, &Error{Code: ErrorNotConnected, Message: "SSH 服务器尚未连接"}
+	}
+	runner, ok := m.runner.(outputRunner)
+	if !ok {
+		return CommandOutput{}, &Error{Code: ErrorDependency, Message: "SSH 执行器不支持远程命令输出"}
+	}
+	args := []string{"-S", controlPath, "-T", "-o", "BatchMode=yes", "--", host}
+	args = append(args, command...)
+	result, err := runner.Output(ctx, CommandSpec{Binary: "ssh", Args: args})
+	if err == nil {
+		return result, nil
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return result, &Error{Code: ErrorCancelled, Message: "用户取消了远程命令"}
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return result, &Error{Code: ErrorTimeout, Message: "远程命令执行超时"}
+	}
+	return result, classifyError(result.Stderr, "远程 SSH 命令执行失败")
+}
+
 func (m *Manager) stopSession(ctx context.Context, s *session) {
 	s.mu.Lock()
 	if s.status == StatusDisconnected {
@@ -500,6 +597,18 @@ func validateHost(host string) error {
 	for _, r := range host {
 		if unicode.IsSpace(r) || unicode.IsControl(r) || strings.ContainsRune("*?!", r) {
 			return errors.New("SSH Host 别名无效")
+		}
+	}
+	return nil
+}
+
+func validateRemoteCommand(command []string) error {
+	if len(command) == 0 || command[0] == "" {
+		return errors.New("远程命令不能为空")
+	}
+	for _, argument := range command {
+		if argument == "" || strings.IndexByte(argument, 0) >= 0 || strings.ContainsAny(argument, " \t\r\n;&|`$(){}[]<>*?!\\\"'") {
+			return errors.New("远程命令参数无效")
 		}
 	}
 	return nil
