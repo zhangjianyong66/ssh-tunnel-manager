@@ -171,3 +171,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: 完成M4可靠性与控制台体验
+
+**Date**: 2026-07-24
+**Task**: 完成M4可靠性与控制台体验
+**Branch**: `master`
+
+### Summary
+
+实现隧道有界自动重连、Host级主连接共享恢复、运行时长与重连状态、有界脱敏内存日志、日志API、XDG自动刷新偏好和控制台展示；通过全量竞态测试、静态检查、构建、运行时冒烟及桌面/移动视觉检查。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `7e35729` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

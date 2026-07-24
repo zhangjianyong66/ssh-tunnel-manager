@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 5
+- **Total Sessions**: 6
 - **Last Active**: 2026-07-24
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~173 | Active |
+| `journal-1.md` | ~206 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 6 | 2026-07-24 | 完成M4可靠性与控制台体验 | `7e35729` | `master` |
 | 5 | 2026-07-24 | 完成 M3 端口转发与隧道管理 | `f34119d` | `master` |
 | 4 | 2026-07-24 | 完成M2远程端口发现 | `50f46b0` | `master` |
 | 3 | 2026-07-24 | 完成M1 SSH配置与连接 | `ac7c202` | `master` |
