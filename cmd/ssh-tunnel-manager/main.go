@@ -1,15 +1,25 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
-	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"os"
-	"strings"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/credential"
+	sshmanager "github.com/zhangjianyong66/ssh-tunnel-manager/internal/ssh"
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/web"
 )
 
 const (
@@ -17,91 +27,80 @@ const (
 	cookieName  = "stm_token"
 )
 
-var pageTemplate = template.Must(template.New("index").Parse(`<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SSH 隧道管理器</title>
-  <style>
-    :root { color-scheme: light; font-family: system-ui, sans-serif; }
-    body { max-width: 880px; margin: 48px auto; padding: 0 24px; color: #1f2937; }
-    header { border-bottom: 1px solid #e5e7eb; margin-bottom: 28px; }
-    h1 { margin-bottom: 8px; }
-    .muted { color: #6b7280; }
-    .panel { border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; }
-    code { background: #f3f4f6; padding: 2px 5px; border-radius: 4px; }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>SSH 隧道管理器</h1>
-    <p class="muted">本地 Web 控制台基础入口已启动。</p>
-  </header>
-  <section class="panel">
-    <h2>MVP 开发中</h2>
-    <p>下一步将读取本机 <code>~/.ssh/config</code>，连接目标服务器并展示 TCP 监听端口。</p>
-    <p>当前服务仅监听 <code>127.0.0.1</code>，访问令牌只保存在本次进程内存中。</p>
-  </section>
-</body>
-</html>`))
-
 func main() {
 	addr := flag.String("addr", defaultAddr, "本地 Web 服务监听地址（必须是回环地址）")
 	flag.Parse()
-
 	if !isLoopbackAddr(*addr) {
 		log.Fatalf("拒绝监听非回环地址: %s", *addr)
 	}
-
 	token, err := newToken()
 	if err != nil {
 		log.Fatalf("生成访问令牌失败: %v", err)
 	}
+	runtimeDir, err := createRuntimeDir()
+	if err != nil {
+		log.Fatalf("创建 SSH 运行目录失败: %v", err)
+	}
+	defer os.RemoveAll(runtimeDir)
+	manager, err := sshmanager.NewManager(sshmanager.RealRunner{}, credential.NewSecretServiceStore(), runtimeDir)
+	if err != nil {
+		log.Fatalf("初始化 SSH 管理器失败: %v", err)
+	}
+	configPath := filepath.Join(userHomeDir(), ".ssh", "config")
+	app, err := web.NewApp(configPath, manager)
+	if err != nil {
+		log.Fatalf("初始化 Web 控制台失败: %v", err)
+	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if !authorize(w, r, token) {
-			return
-		}
-		if err := pageTemplate.Execute(w, nil); err != nil {
-			log.Printf("渲染页面失败: %v", err)
-		}
-	})
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok\n"))
 	})
-
-	url := fmt.Sprintf("http://%s/?token=%s", *addr, token)
-	fmt.Fprintf(os.Stdout, "SSH 隧道管理器已启动\n控制台: %s\n按 Ctrl+C 停止\n", url)
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !authorize(w, r, token) {
+			return
+		}
+		app.Handler().ServeHTTP(w, r)
+	}))
+	server := &http.Server{Addr: *addr, Handler: mux}
+	stopContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- server.ListenAndServe() }()
+	fmt.Fprintf(os.Stdout, "SSH 隧道管理器已启动\n控制台: http://%s/?token=%s\n按 Ctrl+C 停止\n", *addr, token)
 	log.Printf("listening on %s", *addr)
-	if err := http.ListenAndServe(*addr, mux); err != nil {
-		log.Fatal(err)
+
+	select {
+	case err := <-serverErr:
+		if err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP 服务停止: %v", err)
+		}
+	case <-stopContext.Done():
+	}
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := manager.Close(shutdownContext); err != nil {
+		log.Printf("清理 SSH 连接失败: %v", err)
+	}
+	if err := server.Shutdown(shutdownContext); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		log.Printf("关闭 HTTP 服务失败: %v", err)
 	}
 }
 
 func authorize(w http.ResponseWriter, r *http.Request, token string) bool {
 	if r.URL.Query().Get("token") == token {
-		http.SetCookie(w, &http.Cookie{
-			Name:     cookieName,
-			Value:    token,
-			Path:     "/",
-			HttpOnly: true,
-			SameSite: http.SameSiteStrictMode,
-		})
+		http.SetCookie(w, &http.Cookie{Name: cookieName, Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
 		if r.URL.Path == "/" {
 			http.Redirect(w, r, "/", http.StatusFound)
 			return false
 		}
 		return true
 	}
-
 	cookie, err := r.Cookie(cookieName)
 	if err == nil && cookie.Value == token {
 		return true
 	}
-
 	http.Error(w, "未授权：请使用程序输出的带 token 地址访问", http.StatusUnauthorized)
 	return false
 }
@@ -115,5 +114,26 @@ func newToken() (string, error) {
 }
 
 func isLoopbackAddr(addr string) bool {
-	return strings.HasPrefix(addr, "127.0.0.1:") || strings.HasPrefix(addr, "localhost:") || strings.HasPrefix(addr, "[::1]:")
+	host, portText, err := net.SplitHostPort(addr)
+	if err != nil || (host != "127.0.0.1" && host != "localhost" && host != "::1") {
+		return false
+	}
+	port, err := strconv.Atoi(portText)
+	return err == nil && port > 0 && port <= 65535
+}
+
+func userHomeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "."
+	}
+	return home
+}
+
+func createRuntimeDir() (string, error) {
+	base := os.Getenv("XDG_RUNTIME_DIR")
+	if base == "" {
+		base = os.TempDir()
+	}
+	return os.MkdirTemp(base, "ssh-tunnel-manager-")
 }

@@ -1,0 +1,32 @@
+{
+  "id": "complete-mvp",
+  "name": "complete-mvp",
+  "title": "完成 SSH 隧道管理器 MVP",
+  "description": "",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "zhangjianyong",
+  "assignee": "zhangjianyong",
+  "createdAt": "2026-07-23",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "07-23-m2-port-discovery",
+    "07-23-m3-tunnel-management",
+    "07-23-m4-reliability-ui",
+    "07-23-m5-linux-release",
+    "07-23-m1-ssh-connection"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

@@ -53,6 +53,20 @@ ssh -N -T \
 
 真实实现必须使用参数数组，不得拼接 shell 字符串；主机别名、端口和路径都要经过类型校验。
 
+M1 已实现每台服务器一个长期 ControlMaster 主连接：
+
+```bash
+ssh -M -N -T \
+  -o ControlMaster=yes \
+  -o ControlPersist=no \
+  -o ControlPath=<程序专用运行时路径> \
+  <host-alias>
+```
+
+连接只有在 `ssh -S <control-path> -O check <host-alias>` 成功后才进入已连接状态。断开时优先执行精确的 `-O exit`，随后只通过程序保存的进程句柄进行有界清理。程序不设置 `StrictHostKeyChecking=no`，未知或变化的主机密钥继续由用户的 OpenSSH 配置和 `known_hosts` 策略处理。
+
+密码和私钥口令通过受限权限的临时 askpass helper 与命名管道传递，不出现在命令参数和环境变量中，也不写入普通文件。用户明确选择保存时，通过内嵌 D-Bus 客户端写入 Linux Secret Service；密钥环不可用时安全失败，不降级为明文文件。
+
 ## 4. 远程端口探测
 
 优先执行：
@@ -90,8 +104,10 @@ API 仅监听回环地址，所有业务路由都要求令牌 Cookie：
 
 ```text
 GET  /api/ssh-hosts
+POST /api/ssh-hosts/refresh
 POST /api/servers/:host/connect
 POST /api/servers/:host/disconnect
+GET  /api/servers/:host
 GET  /api/servers/:host/ports
 POST /api/servers/:host/ports/refresh
 POST /api/tunnels
@@ -101,3 +117,5 @@ GET  /api/tunnels/:id/logs
 ```
 
 写操作应支持请求幂等标识，错误返回结构化错误码；日志 API 必须脱敏。
+
+M1 已实现 Host 刷新、连接、断开和状态查询。端口及隧道相关路由仍属于后续里程碑。

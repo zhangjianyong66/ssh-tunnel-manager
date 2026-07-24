@@ -34,10 +34,12 @@ go build ./cmd/ssh-tunnel-manager
 
 ## 当前目录与运行约定
 
-- cmd/ssh-tunnel-manager/main.go 是当前唯一可执行入口；internal/ 预留后续实现包，docs/ 保存产品、架构和路线文档。
+- cmd/ssh-tunnel-manager/main.go 是当前唯一可执行入口；internal/credential 负责 Secret Service，internal/ssh 负责 OpenSSH ControlMaster 生命周期，internal/sshconfig 负责 SSH 配置解析，internal/web 负责本地页面和 API；docs/ 保存产品、架构和路线文档。
 - 本地开发使用 go run ./cmd/ssh-tunnel-manager，默认控制台地址为 127.0.0.1:8765；构建使用 go build -o ssh-tunnel-manager ./cmd/ssh-tunnel-manager。
 - 当前 MVP 没有 _test.go 文件，但所有行为变更仍需运行 go test ./...、go vet ./... 和构建命令；新增功能应在对应 Go 包旁添加单元测试。
 - 当前部署是直接运行单文件 Linux 可执行程序，没有安装脚本、systemd 单元或容器暴露配置；不得通过部署配置把回环服务暴露到局域网或公网。
+- SSH 连接运行目录创建在 `${XDG_RUNTIME_DIR:-系统临时目录}/ssh-tunnel-manager-*`，权限为 `0700`，每个 Host 使用独立短 ControlPath；程序退出或显式断开时清理。
+- 凭据持久化通过 Go D-Bus 客户端访问 Linux Secret Service/GNOME Keyring；没有可用会话时不得降级为明文存储。
 - 源码公开仓库为 https://github.com/zhangjianyong66/ssh-tunnel-manager.git，默认分支为 master，使用 GitHub CLI 登录账号通过 HTTPS 推送。
 
 所有计划、设计和提交说明使用中文。新增可复用的运行方式、目录结构或部署约定时，及时更新本文件。

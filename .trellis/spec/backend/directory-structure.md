@@ -5,7 +5,10 @@
 ## 当前布局
 
     cmd/ssh-tunnel-manager/main.go  可执行程序入口、HTTP 路由和 MVP 页面
-    internal/                       预留内部实现包；当前仅有 .gitkeep
+    internal/credential/            Secret Service 凭据接口和 D-Bus 适配器
+    internal/ssh/                   OpenSSH ControlMaster、askpass 和连接状态
+    internal/sshconfig/             OpenSSH 配置、Include 和显式 Host 解析
+    internal/web/                   本地控制台页面和 M1 HTTP API
     docs/                           产品、架构和开发路线文档
     go.mod                          Go 模块定义（Go 1.22）
     .trellis/spec/backend/          后端代码规范
