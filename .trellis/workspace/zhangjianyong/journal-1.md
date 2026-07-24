@@ -138,3 +138,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: 完成 M3 端口转发与隧道管理
+
+**Date**: 2026-07-24
+**Task**: 完成 M3 端口转发与隧道管理
+**Branch**: `master`
+
+### Summary
+
+完成 ControlMaster 本地转发、并发幂等隧道管理、认证 API、控制台操作、生命周期清理、运行时验证和后端规范同步。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f34119d` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
