@@ -4,7 +4,7 @@ SSH 隧道管理器是一个运行在本地的 Go 单文件程序。它启动一
 
 ## 当前状态
 
-项目已完成 MVP 的远程端口发现阶段。目前已实现：
+项目已完成 MVP 的端口转发与隧道管理阶段。目前已实现：
 
 - Go 单文件程序入口；
 - 仅监听 `127.0.0.1` 的本地 Web 服务；
@@ -19,9 +19,14 @@ SSH 隧道管理器是一个运行在本地的 Go 单文件程序。它启动一
 - 通过已有 ControlMaster 执行并解析远程 `ss -ltnp`，必要时退化为 `ss -ltn`；
 - 在控制台查看 TCP 监听端口和可见进程名，支持手动刷新；
 - 按服务器启用默认关闭的 10 秒自动刷新，失败时保留最后一次成功结果；
+- 复用既有 ControlMaster 创建仅监听 `127.0.0.1` 的本地端口转发；
+- 本地端口同号优先，冲突时自动分配其他回环端口；
+- 同时管理多台服务器和多个远程端口，并对重复创建保持幂等；
+- 在控制台查看、复制、打开、重试和精确停止隧道；
+- 断开服务器或退出程序时按资源依赖顺序有界清理隧道；
 - 产品、架构和路线文档。
 
-端口转发和自动重连将在后续迭代实现，具体边界见 [docs/product-design.md](docs/product-design.md)。远程服务器需要提供 `ss` 命令。
+自动重连、运行时长、重连次数和脱敏原始日志将在 M4 实现，具体边界见 [docs/product-design.md](docs/product-design.md)。远程服务器需要提供 `ss` 命令。
 
 ## 开发运行
 
@@ -47,7 +52,8 @@ internal/credential/     Secret Service 凭据接口与适配器
 internal/portdiscovery/  远程 TCP 监听端口解析与刷新状态
 internal/ssh/            OpenSSH ControlMaster 连接管理
 internal/sshconfig/      SSH 配置与 Include 解析
-internal/web/            本地控制台页面和 M1/M2 API
+internal/tunnel/         本地端口分配与隧道生命周期
+internal/web/            本地控制台页面和 M1/M2/M3 API
 docs/                    产品与技术文档
 go.mod                   Go 模块定义
 ```

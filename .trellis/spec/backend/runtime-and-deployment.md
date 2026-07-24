@@ -33,4 +33,4 @@
 - Web 服务和本地转发端口只监听回环地址，不应通过反向代理、容器端口映射或防火墙规则暴露到局域网/公网。
 - 未来非敏感偏好写入 XDG_CONFIG_HOME（未设置时使用 ~/.config）下的 ssh-tunnel-manager/config.json；运行日志和诊断写入 XDG_STATE_HOME（未设置时使用 ~/.local/state）下的 ssh-tunnel-manager/。
 - 密码和私钥口令只进入 Linux Secret Service / GNOME Keyring；不得随部署产物或配置文件复制。
-- 程序退出或用户显式停止时关闭 SSH 子进程和监听端口；浏览器页面生命周期不参与服务生命周期。
+- 显式断开 Host 时先停止该 Host 的隧道，再停止自动刷新，最后断开 ControlMaster。程序退出时依次关闭隧道管理器、端口发现服务、SSH 管理器和 HTTP 服务；浏览器页面生命周期不参与服务生命周期。

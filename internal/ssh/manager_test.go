@@ -40,6 +40,63 @@ type fakeRunner struct {
 	outputErr error
 }
 
+type forwardRunner struct {
+	mu             sync.Mutex
+	specs          []CommandSpec
+	runs           []CommandSpec
+	master         *fakeProcess
+	forward        *fakeProcess
+	checkFailures  map[int]error
+	checkStarted   chan struct{}
+	releaseCheck   chan struct{}
+	checkCallCount int
+}
+
+func (r *forwardRunner) Start(_ context.Context, spec CommandSpec) (Process, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.specs = append(r.specs, spec)
+	if containsArg(spec.Args, "-L") {
+		if r.forward == nil {
+			r.forward = newFakeProcess()
+		}
+		return r.forward, nil
+	}
+	if r.master == nil {
+		r.master = newFakeProcess()
+	}
+	return r.master, nil
+}
+
+func (r *forwardRunner) Run(_ context.Context, spec CommandSpec) error {
+	r.mu.Lock()
+	r.runs = append(r.runs, spec)
+	isCheck := containsArg(spec.Args, "check")
+	if !isCheck {
+		r.mu.Unlock()
+		return nil
+	}
+	r.checkCallCount++
+	call := r.checkCallCount
+	err := r.checkFailures[call]
+	started, release := r.checkStarted, r.releaseCheck
+	r.mu.Unlock()
+	if started != nil && call == 3 {
+		close(started)
+		<-release
+	}
+	return err
+}
+
+func containsArg(args []string, wanted string) bool {
+	for _, argument := range args {
+		if argument == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 type multiProcessRunner struct {
 	mu        sync.Mutex
 	processes map[string]*fakeProcess
@@ -258,6 +315,132 @@ func TestManagerExecuteRejectsDisconnectedAndInvalidCommand(t *testing.T) {
 		if !errors.As(executeErr, &sshErr) {
 			t.Fatalf("command %#v error = %#v", command, executeErr)
 		}
+	}
+}
+
+func TestManagerStartLocalForwardUsesConnectedControlMaster(t *testing.T) {
+	runner := &forwardRunner{}
+	manager, err := NewManager(runner, nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	connected, err := manager.Connect(context.Background(), "server-a", ConnectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	process, err := manager.StartLocalForward(context.Background(), "server-a", 18080, 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if process != runner.forward {
+		t.Fatal("returned process is not the precise forward process")
+	}
+	runner.mu.Lock()
+	if len(runner.specs) != 2 {
+		runner.mu.Unlock()
+		t.Fatalf("start count = %d, want 2", len(runner.specs))
+	}
+	got := append([]string(nil), runner.specs[1].Args...)
+	runs := append([]CommandSpec(nil), runner.runs...)
+	runner.mu.Unlock()
+	want := []string{
+		"-S", connected.ControlPath,
+		"-N", "-T",
+		"-o", "BatchMode=yes",
+		"-o", "ExitOnForwardFailure=yes",
+		"-L", "127.0.0.1:18080:127.0.0.1:8080",
+		"--", "server-a",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+	checkCount := 0
+	for _, spec := range runs {
+		if containsArg(spec.Args, "check") {
+			checkCount++
+		}
+	}
+	if checkCount != 3 {
+		t.Fatalf("ControlMaster check count = %d, want connect + before + after", checkCount)
+	}
+	runner.forward.finish(nil, "")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _ = manager.Disconnect(ctx, "server-a")
+}
+
+func TestManagerStartLocalForwardRejectsDisconnected(t *testing.T) {
+	manager, err := NewManager(&forwardRunner{}, nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.StartLocalForward(context.Background(), "server-a", 18080, 8080)
+	var sshErr *Error
+	if !errors.As(err, &sshErr) || sshErr.Code != ErrorNotConnected {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestManagerStartLocalForwardCleansProcessWhenPostCheckFails(t *testing.T) {
+	runner := &forwardRunner{checkFailures: map[int]error{3: errors.New("master disappeared")}}
+	manager, err := NewManager(runner, nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Connect(context.Background(), "server-a", ConnectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.StartLocalForward(context.Background(), "server-a", 18080, 8080)
+	var sshErr *Error
+	if !errors.As(err, &sshErr) || sshErr.Code != ErrorNotConnected {
+		t.Fatalf("error = %#v", err)
+	}
+	select {
+	case <-runner.forward.done:
+	default:
+		t.Fatal("forward process was not precisely stopped")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _ = manager.Disconnect(ctx, "server-a")
+}
+
+func TestManagerDisconnectWaitsForForwardStartCriticalSection(t *testing.T) {
+	runner := &forwardRunner{checkStarted: make(chan struct{}), releaseCheck: make(chan struct{})}
+	manager, err := NewManager(runner, nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Connect(context.Background(), "server-a", ConnectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	forwardDone := make(chan error, 1)
+	go func() {
+		_, startErr := manager.StartLocalForward(context.Background(), "server-a", 18080, 8080)
+		forwardDone <- startErr
+	}()
+	<-runner.checkStarted
+	disconnectDone := make(chan struct{})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_, _ = manager.Disconnect(ctx, "server-a")
+		close(disconnectDone)
+	}()
+	select {
+	case <-disconnectDone:
+		t.Fatal("disconnect did not wait for forward start critical section")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(runner.releaseCheck)
+	if err := <-forwardDone; err != nil {
+		t.Fatal(err)
+	}
+	runner.forward.finish(nil, "")
+	select {
+	case <-disconnectDone:
+	case <-time.After(time.Second):
+		t.Fatal("disconnect did not finish")
 	}
 }
 

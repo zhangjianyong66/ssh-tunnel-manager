@@ -1,10 +1,40 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+type recordingTunnelCloser struct{ order *[]string }
+
+func (c recordingTunnelCloser) Close(context.Context) error {
+	*c.order = append(*c.order, "tunnels")
+	return nil
+}
+
+type recordingDiscoveryCloser struct{ order *[]string }
+
+func (c recordingDiscoveryCloser) Close() error {
+	*c.order = append(*c.order, "discovery")
+	return nil
+}
+
+type recordingSSHCloser struct{ order *[]string }
+
+func (c recordingSSHCloser) Close(context.Context) error {
+	*c.order = append(*c.order, "ssh")
+	return nil
+}
+
+type recordingHTTPCloser struct{ order *[]string }
+
+func (c recordingHTTPCloser) Shutdown(context.Context) error {
+	*c.order = append(*c.order, "http")
+	return nil
+}
 
 func TestAuthorizeRequiresTokenAndSetsStrictCookie(t *testing.T) {
 	unauthorized := httptest.NewRecorder()
@@ -43,5 +73,19 @@ func TestIsLoopbackAddr(t *testing.T) {
 	}
 	if isLoopbackAddr("0.0.0.0:8765") {
 		t.Fatal("non-loopback accepted")
+	}
+}
+
+func TestShutdownRuntimeClosesServicesInDependencyOrder(t *testing.T) {
+	var order []string
+	shutdownRuntime(
+		context.Background(),
+		recordingTunnelCloser{order: &order},
+		recordingDiscoveryCloser{order: &order},
+		recordingSSHCloser{order: &order},
+		recordingHTTPCloser{order: &order},
+	)
+	if got := strings.Join(order, ","); got != "tunnels,discovery,ssh,http" {
+		t.Fatalf("shutdown order = %s", got)
 	}
 }

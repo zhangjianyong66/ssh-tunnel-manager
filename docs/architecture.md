@@ -13,7 +13,7 @@
   ├── 远程端口探测器
   ├── 隧道生命周期管理器
   ├── 本地端口分配器
-  ├── 自动重连协调器
+  ├── 自动重连协调器（M4）
   ├── 凭据存储（Secret Service）
   └── 偏好设置存储（XDG 配置目录）
        │
@@ -40,18 +40,17 @@
 - `known_hosts`；
 - 服务器密码与私钥口令交互。
 
-端口转发使用等价于以下命令的参数：
+M3 的端口转发复用已经就绪的 ControlMaster，使用等价于以下命令的参数：
 
 ```bash
-ssh -N -T \
+ssh -S <control-path> -N -T \
+  -o BatchMode=yes \
   -o ExitOnForwardFailure=yes \
-  -o ServerAliveInterval=30 \
-  -o ServerAliveCountMax=3 \
   -L 127.0.0.1:<local-port>:127.0.0.1:<remote-port> \
-  <host-alias>
+  -- <host-alias>
 ```
 
-真实实现必须使用参数数组，不得拼接 shell 字符串；主机别名、端口和路径都要经过类型校验。
+真实实现必须使用参数数组，不得拼接 shell 字符串；主机别名、端口和路径都要经过类型校验。转发前后均执行精确的 ControlMaster check，避免主连接消失时退化为新的独立 SSH 连接。
 
 M1 已实现每台服务器一个长期 ControlMaster 主连接：
 
@@ -93,40 +92,48 @@ ss -ltn
 
 端口发现状态仅保存在内存中。同一 Host 的并发刷新共享一次正在进行的探测，不同 Host 可以并行；失败不会清空最后一次成功列表。自动刷新默认关闭，用户启用后由服务端每 10 秒执行一次，浏览器关闭不改变该状态，程序退出时先取消刷新任务再关闭 SSH 主连接。
 
-## 5. 状态模型
+## 5. 本地隧道管理
+
+`internal/tunnel` 是隧道 ID、目标幂等键、本地端口预留、进程句柄和状态快照的唯一所有者。本地端口先尝试远程同号端口；不可用时由操作系统选择其他 `127.0.0.1` 端口，并在进程内预留以避免并发创建互相争用。OpenSSH 实际绑定与预检之间仍可能发生外部竞争，只有明确的本地绑定冲突会触发有界重试。
+
+同一 Host 和远程端口的并发创建收敛到同一条隧道，不同目标可以并行。每条隧道只由一个监控 goroutine 调用 `Wait`；停止时先对保存的精确进程句柄发送中断，有界等待后才升级为强制终止。隧道意外退出后保留安全失败快照，用户可以重试或清除；M3 不自动重连。
+
+页面每轮只获取一次隧道列表，再按 Host 和远程端口映射到端口表，同时保留独立隧道总览。浏览器刷新或关闭不改变服务端隧道。显式断开 Host 时按“停止该 Host 隧道 → 关闭自动刷新 → 断开 ControlMaster”执行；程序退出按“全部隧道 → 端口发现 → SSH → HTTP”清理。
+
+## 6. 状态模型
 
 - `Server`: SSH Host 别名、连接状态、最近错误、端口列表。
 - `RemotePort`: 远程端口、进程名、最后探测时间。
-- `Tunnel`: 服务器别名、远程端口、本地端口、SSH 进程句柄、状态、重连信息。
+- `Tunnel`: 随机 ID、服务器别名、远程端口、本地端口、SSH 进程句柄、基础状态和安全错误；M4 增加重连信息。
 - `CredentialRef`: 密钥环服务名和账户标识，不保存秘密内容。
 - `Preference`: Web 端口、刷新策略、端口分配策略和界面偏好。
 
-## 6. 数据持久化
+## 7. 数据持久化
 
 - Linux Secret Service：服务器密码、私钥口令。
 - `${XDG_CONFIG_HOME:-~/.config}/ssh-tunnel-manager/config.json`：非敏感偏好。
 - `${XDG_STATE_HOME:-~/.local/state}/ssh-tunnel-manager/`：运行日志和诊断信息，权限收紧为用户可读写。
 - 不复制或重写 `~/.ssh/config`，不存储完整私钥内容。
 
-## 7. HTTP API 草案
+## 8. HTTP API
 
 API 仅监听回环地址，所有业务路由都要求令牌 Cookie：
 
 ```text
 GET  /api/ssh-hosts
 POST /api/ssh-hosts/refresh
-POST /api/servers/:host/connect
-POST /api/servers/:host/disconnect
-GET  /api/servers/:host
-GET  /api/servers/:host/ports
-POST /api/servers/:host/ports/refresh
-PUT  /api/servers/:host/ports/auto-refresh
+POST /api/servers/{host}/connect
+POST /api/servers/{host}/disconnect
+GET  /api/servers/{host}
+GET  /api/servers/{host}/ports
+POST /api/servers/{host}/ports/refresh
+PUT  /api/servers/{host}/ports/auto-refresh
 POST /api/tunnels
 GET  /api/tunnels
-DELETE /api/tunnels/:id
-GET  /api/tunnels/:id/logs
+DELETE /api/tunnels/{id}
+GET  /api/tunnels/{id}/logs  （M4）
 ```
 
 写操作应支持请求幂等标识，错误返回结构化错误码；日志 API 必须脱敏。
 
-M1 已实现 Host 刷新、连接、断开和状态查询；M2 已实现端口查询、手动刷新和自动刷新切换。隧道相关路由仍属于后续里程碑。
+M1 已实现 Host 刷新、连接、断开和状态查询；M2 已实现端口查询、手动刷新和自动刷新切换；M3 已实现隧道创建、列表和幂等停止。日志 API 和客户端请求幂等标识仍属于后续里程碑。

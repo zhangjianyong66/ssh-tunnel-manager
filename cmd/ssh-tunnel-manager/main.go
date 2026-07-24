@@ -20,6 +20,7 @@ import (
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/credential"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/portdiscovery"
 	sshmanager "github.com/zhangjianyong66/ssh-tunnel-manager/internal/ssh"
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/tunnel"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/web"
 )
 
@@ -51,8 +52,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("初始化端口发现服务失败: %v", err)
 	}
+	tunnels := tunnel.NewManager(manager)
 	configPath := filepath.Join(userHomeDir(), ".ssh", "config")
-	app, err := web.NewApp(configPath, manager, discovery)
+	app, err := web.NewApp(configPath, manager, discovery, tunnels)
 	if err != nil {
 		log.Fatalf("初始化 Web 控制台失败: %v", err)
 	}
@@ -85,13 +87,36 @@ func main() {
 	}
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	shutdownRuntime(shutdownContext, tunnels, discovery, manager, server)
+}
+
+type tunnelCloser interface {
+	Close(context.Context) error
+}
+
+type discoveryCloser interface {
+	Close() error
+}
+
+type sshCloser interface {
+	Close(context.Context) error
+}
+
+type httpCloser interface {
+	Shutdown(context.Context) error
+}
+
+func shutdownRuntime(ctx context.Context, tunnels tunnelCloser, discovery discoveryCloser, manager sshCloser, server httpCloser) {
+	if err := tunnels.Close(ctx); err != nil {
+		log.Printf("停止 SSH 隧道失败: %v", err)
+	}
 	if err := discovery.Close(); err != nil {
 		log.Printf("停止端口发现服务失败: %v", err)
 	}
-	if err := manager.Close(shutdownContext); err != nil {
+	if err := manager.Close(ctx); err != nil {
 		log.Printf("清理 SSH 连接失败: %v", err)
 	}
-	if err := server.Shutdown(shutdownContext); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	if err := server.Shutdown(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		log.Printf("关闭 HTTP 服务失败: %v", err)
 	}
 }

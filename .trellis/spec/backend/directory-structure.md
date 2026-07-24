@@ -9,7 +9,8 @@
     internal/portdiscovery/         ss 输出解析、端口快照和自动刷新生命周期
     internal/ssh/                   OpenSSH ControlMaster、askpass 和连接状态
     internal/sshconfig/             OpenSSH 配置、Include 和显式 Host 解析
-    internal/web/                   本地控制台页面和 M1/M2 HTTP API
+    internal/tunnel/                回环端口分配、隧道状态和精确进程清理
+    internal/web/                   本地控制台页面和 M1/M2/M3 HTTP API
     docs/                           产品、架构和开发路线文档
     go.mod                          Go 模块定义（Go 1.22）
     .trellis/spec/backend/          后端代码规范

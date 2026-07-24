@@ -8,11 +8,13 @@ import (
 	"html/template"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/portdiscovery"
 	sshmanager "github.com/zhangjianyong66/ssh-tunnel-manager/internal/ssh"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/sshconfig"
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/tunnel"
 )
 
 type configLoader interface {
@@ -31,6 +33,13 @@ type portDiscovery interface {
 	SetAutoRefresh(string, bool) (portdiscovery.Snapshot, error)
 }
 
+type tunnelService interface {
+	Create(context.Context, string, uint16) (tunnel.Snapshot, error)
+	List() []tunnel.Snapshot
+	Stop(context.Context, string) error
+	StopHost(context.Context, string) error
+}
+
 // App owns the SSH configuration snapshot and control-page HTTP handlers.
 type App struct {
 	mu         sync.RWMutex
@@ -39,22 +48,26 @@ type App struct {
 	loader     configLoader
 	sessions   sessionManager
 	ports      portDiscovery
+	tunnels    tunnelService
 	handler    http.Handler
 }
 
 // NewApp loads the initial SSH config and creates the control-page handler.
-func NewApp(configPath string, sessions sessionManager, ports portDiscovery) (*App, error) {
-	return newApp(configPath, sshconfig.Loader{}, sessions, ports)
+func NewApp(configPath string, sessions sessionManager, ports portDiscovery, tunnels tunnelService) (*App, error) {
+	return newApp(configPath, sshconfig.Loader{}, sessions, ports, tunnels)
 }
 
-func newApp(configPath string, loader configLoader, sessions sessionManager, ports portDiscovery) (*App, error) {
+func newApp(configPath string, loader configLoader, sessions sessionManager, ports portDiscovery, tunnels tunnelService) (*App, error) {
 	if sessions == nil {
 		return nil, errors.New("SSH 会话管理器不能为空")
 	}
 	if ports == nil {
 		return nil, errors.New("端口发现服务不能为空")
 	}
-	app := &App{configPath: configPath, loader: loader, sessions: sessions, ports: ports}
+	if tunnels == nil {
+		return nil, errors.New("隧道服务不能为空")
+	}
+	app := &App{configPath: configPath, loader: loader, sessions: sessions, ports: ports, tunnels: tunnels}
 	if err := app.refresh(); err != nil {
 		return nil, err
 	}
@@ -68,6 +81,9 @@ func newApp(configPath string, loader configLoader, sessions sessionManager, por
 	mux.HandleFunc("GET /api/servers/{host}/ports", app.handlePorts)
 	mux.HandleFunc("POST /api/servers/{host}/ports/refresh", app.handlePortsRefresh)
 	mux.HandleFunc("PUT /api/servers/{host}/ports/auto-refresh", app.handleAutoRefresh)
+	mux.HandleFunc("POST /api/tunnels", app.handleCreateTunnel)
+	mux.HandleFunc("GET /api/tunnels", app.handleTunnels)
+	mux.HandleFunc("DELETE /api/tunnels/{id}", app.handleStopTunnel)
 	app.handler = mux
 	return app, nil
 }
@@ -177,15 +193,65 @@ func (a *App) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "host_not_found", "SSH Host 不存在于当前配置")
 		return
 	}
-	if a.ports != nil {
-		_, _ = a.ports.SetAutoRefresh(host, false)
-	}
+	tunnelErr := a.tunnels.StopHost(r.Context(), host)
+	_, _ = a.ports.SetAutoRefresh(host, false)
 	snapshot, err := a.sessions.Disconnect(r.Context(), host)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "disconnect_failed", "停止 SSH 连接失败")
 		return
 	}
+	if tunnelErr != nil {
+		writeTunnelError(w, tunnelErr)
+		return
+	}
 	writeJSON(w, http.StatusOK, snapshot)
+}
+
+type createTunnelRequest struct {
+	Host       string `json:"host"`
+	RemotePort *int   `json:"remotePort"`
+}
+
+func (a *App) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	var request createTunnelRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil || decoder.Decode(&struct{}{}) != io.EOF || strings.TrimSpace(request.Host) == "" || request.RemotePort == nil || *request.RemotePort < 1 || *request.RemotePort > 65535 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "隧道创建请求格式无效")
+		return
+	}
+	if !a.requireHost(w, request.Host) {
+		return
+	}
+	if a.sessions.Snapshot(request.Host).Status != sshmanager.StatusConnected {
+		writeError(w, http.StatusConflict, string(tunnel.ErrorServerNotConnected), "SSH 服务器尚未连接")
+		return
+	}
+	snapshot, err := a.tunnels.Create(r.Context(), request.Host, uint16(*request.RemotePort))
+	if err != nil {
+		writeTunnelError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func (a *App) handleTunnels(w http.ResponseWriter, _ *http.Request) {
+	tunnels := a.tunnels.List()
+	if tunnels == nil {
+		tunnels = []tunnel.Snapshot{}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Tunnels []tunnel.Snapshot `json:"tunnels"`
+	}{Tunnels: tunnels})
+}
+
+func (a *App) handleStopTunnel(w http.ResponseWriter, r *http.Request) {
+	if err := a.tunnels.Stop(r.Context(), r.PathValue("id")); err != nil {
+		writeTunnelError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *App) handlePorts(w http.ResponseWriter, r *http.Request) {
@@ -283,6 +349,30 @@ func writeDiscoveryError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, string(discoveryErr.Code), discoveryErr.Message)
 	default:
 		writeError(w, http.StatusBadGateway, string(portdiscovery.ErrorFailed), "远程端口探测失败")
+	}
+}
+
+func writeTunnelError(w http.ResponseWriter, err error) {
+	var tunnelErr *tunnel.Error
+	if !errors.As(err, &tunnelErr) {
+		writeError(w, http.StatusBadGateway, string(tunnel.ErrorStartFailed), "SSH 隧道操作失败")
+		return
+	}
+	switch tunnelErr.Code {
+	case tunnel.ErrorInvalid:
+		writeError(w, http.StatusBadRequest, string(tunnelErr.Code), "隧道目标无效")
+	case tunnel.ErrorServerNotConnected:
+		writeError(w, http.StatusConflict, string(tunnelErr.Code), "SSH 服务器尚未连接")
+	case tunnel.ErrorLocalPortUnavailable:
+		writeError(w, http.StatusConflict, string(tunnelErr.Code), "没有可用的本地回环端口")
+	case tunnel.ErrorTimeout:
+		writeError(w, http.StatusGatewayTimeout, string(tunnelErr.Code), "SSH 隧道操作超时")
+	case tunnel.ErrorCancelled:
+		writeError(w, http.StatusRequestTimeout, string(tunnelErr.Code), "用户取消了隧道操作")
+	case tunnel.ErrorServiceClosed:
+		writeError(w, http.StatusServiceUnavailable, string(tunnelErr.Code), "隧道服务已关闭")
+	default:
+		writeError(w, http.StatusBadGateway, string(tunnel.ErrorStartFailed), "SSH 隧道操作失败")
 	}
 }
 

@@ -11,6 +11,7 @@
 5. 修改后执行格式化、测试、静态检查和构建命令。
 6. 涉及 SSH 配置、认证、ControlMaster、M1 API 或 M2/M3 连接复用时，阅读 ssh-connection.md。
 7. 涉及远程 `ss`、端口快照、自动刷新或 M2 API 时，阅读 port-discovery.md。
+8. 涉及本地转发、端口分配、隧道 API/页面或 M3 清理顺序时，阅读 tunnel-management.md。
 
 ## 规范索引
 
@@ -24,6 +25,7 @@
 | [project-conventions.md](./project-conventions.md) | 安全、OpenSSH、HTTP 生命周期及文档约定 |
 | [ssh-connection.md](./ssh-connection.md) | SSH Host、ControlMaster、askpass、Secret Service 和 M1 API 可执行契约 |
 | [port-discovery.md](./port-discovery.md) | 受控远程命令、ss 解析、刷新状态和 M2 API 可执行契约 |
+| [tunnel-management.md](./tunnel-management.md) | 回环端口分配、精确进程生命周期、M3 API 和控制台契约 |
 
 ## 质量检查
 

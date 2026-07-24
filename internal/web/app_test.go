@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,19 +14,83 @@ import (
 
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/portdiscovery"
 	sshmanager "github.com/zhangjianyong66/ssh-tunnel-manager/internal/ssh"
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/tunnel"
 )
 
 type fakeSessions struct {
-	mu      sync.Mutex
-	states  map[string]sshmanager.Snapshot
-	options sshmanager.ConnectOptions
+	mu           sync.Mutex
+	states       map[string]sshmanager.Snapshot
+	options      sshmanager.ConnectOptions
+	onDisconnect func(string)
 }
 
 type fakePorts struct {
-	mu        sync.Mutex
-	snapshots map[string]portdiscovery.Snapshot
-	refreshes int
-	err       error
+	mu               sync.Mutex
+	snapshots        map[string]portdiscovery.Snapshot
+	refreshes        int
+	err              error
+	onSetAutoRefresh func(string, bool)
+}
+
+type fakeTunnels struct {
+	mu             sync.Mutex
+	snapshots      []tunnel.Snapshot
+	createSnapshot tunnel.Snapshot
+	createErr      error
+	stopErr        error
+	stopHostErr    error
+	createCalls    int
+	stopIDs        []string
+	stoppedHosts   []string
+	onStopHost     func(string)
+}
+
+func newFakeTunnels() *fakeTunnels {
+	return &fakeTunnels{snapshots: []tunnel.Snapshot{}}
+}
+
+func (f *fakeTunnels) Create(_ context.Context, host string, remotePort uint16) (tunnel.Snapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createCalls++
+	if f.createErr != nil {
+		return f.createSnapshot, f.createErr
+	}
+	if f.createSnapshot.ID == "" {
+		f.createSnapshot = tunnel.Snapshot{
+			ID:         "tunnel-id",
+			Host:       host,
+			RemotePort: remotePort,
+			LocalPort:  remotePort,
+			Address:    fmt.Sprintf("127.0.0.1:%d", remotePort),
+			Status:     tunnel.StatusRunning,
+		}
+		f.snapshots = []tunnel.Snapshot{f.createSnapshot}
+	}
+	return f.createSnapshot, nil
+}
+
+func (f *fakeTunnels) List() []tunnel.Snapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]tunnel.Snapshot(nil), f.snapshots...)
+}
+
+func (f *fakeTunnels) Stop(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopIDs = append(f.stopIDs, id)
+	return f.stopErr
+}
+
+func (f *fakeTunnels) StopHost(_ context.Context, host string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stoppedHosts = append(f.stoppedHosts, host)
+	if f.onStopHost != nil {
+		f.onStopHost(host)
+	}
+	return f.stopHostErr
 }
 
 func newFakePorts() *fakePorts {
@@ -58,6 +123,9 @@ func (f *fakePorts) Refresh(_ context.Context, host string) (portdiscovery.Snaps
 func (f *fakePorts) SetAutoRefresh(host string, enabled bool) (portdiscovery.Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.onSetAutoRefresh != nil {
+		f.onSetAutoRefresh(host, enabled)
+	}
 	if f.err != nil {
 		return f.snapshots[host], f.err
 	}
@@ -83,6 +151,9 @@ func (f *fakeSessions) Connect(_ context.Context, host string, options sshmanage
 func (f *fakeSessions) Disconnect(_ context.Context, host string) (sshmanager.Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.onDisconnect != nil {
+		f.onDisconnect(host)
+	}
 	f.states[host] = sshmanager.Snapshot{Host: host, Status: sshmanager.StatusDisconnected}
 	return f.states[host], nil
 }
@@ -102,7 +173,7 @@ func TestAppHostsAndConnectDoNotEchoSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	sessions := newFakeSessions()
-	app, err := NewApp(configPath, sessions, newFakePorts())
+	app, err := NewApp(configPath, sessions, newFakePorts(), newFakeTunnels())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +206,7 @@ func TestAppRejectsUnknownHostAndUnknownRequestField(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	app, err := NewApp(configPath, newFakeSessions(), newFakePorts())
+	app, err := NewApp(configPath, newFakeSessions(), newFakePorts(), newFakeTunnels())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +234,7 @@ func TestAppPortDiscoveryRoutes(t *testing.T) {
 	sessions := newFakeSessions()
 	sessions.states["server-a"] = sshmanager.Snapshot{Host: "server-a", Status: sshmanager.StatusConnected}
 	ports := newFakePorts()
-	app, err := NewApp(configPath, sessions, ports)
+	app, err := NewApp(configPath, sessions, ports, newFakeTunnels())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +269,7 @@ func TestAppPortRefreshRequiresConnection(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	app, err := NewApp(configPath, newFakeSessions(), newFakePorts())
+	app, err := NewApp(configPath, newFakeSessions(), newFakePorts(), newFakeTunnels())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +301,7 @@ func TestAppMapsPortDiscoveryErrors(t *testing.T) {
 			sessions.states["server-a"] = sshmanager.Snapshot{Host: "server-a", Status: sshmanager.StatusConnected}
 			ports := newFakePorts()
 			ports.err = test.err
-			app, err := NewApp(configPath, sessions, ports)
+			app, err := NewApp(configPath, sessions, ports, newFakeTunnels())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -244,5 +315,209 @@ func TestAppMapsPortDiscoveryErrors(t *testing.T) {
 				t.Fatal("internal discovery detail leaked to HTTP response")
 			}
 		})
+	}
+}
+
+func TestAppTunnelRoutes(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sessions := newFakeSessions()
+	sessions.states["server-a"] = sshmanager.Snapshot{Host: "server-a", Status: sshmanager.StatusConnected}
+	tunnels := newFakeTunnels()
+	app, err := NewApp(configPath, sessions, newFakePorts(), tunnels)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for range 2 {
+		request := httptest.NewRequest(http.MethodPost, "/api/tunnels", strings.NewReader(`{"host":"server-a","remotePort":8080}`))
+		response := httptest.NewRecorder()
+		app.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"id":"tunnel-id"`) || !strings.Contains(response.Body.String(), `"address":"127.0.0.1:8080"`) {
+			t.Fatalf("create = %d %s", response.Code, response.Body.String())
+		}
+	}
+	if tunnels.createCalls != 2 {
+		t.Fatalf("create calls = %d", tunnels.createCalls)
+	}
+
+	listRequest := httptest.NewRequest(http.MethodGet, "/api/tunnels", nil)
+	listResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(listResponse, listRequest)
+	if listResponse.Code != http.StatusOK || !strings.Contains(listResponse.Body.String(), `"tunnels":[`) || !strings.Contains(listResponse.Body.String(), `"id":"tunnel-id"`) {
+		t.Fatalf("list = %d %s", listResponse.Code, listResponse.Body.String())
+	}
+
+	stopRequest := httptest.NewRequest(http.MethodDelete, "/api/tunnels/tunnel-id", nil)
+	stopResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(stopResponse, stopRequest)
+	if stopResponse.Code != http.StatusNoContent || stopResponse.Body.Len() != 0 {
+		t.Fatalf("stop = %d %s", stopResponse.Code, stopResponse.Body.String())
+	}
+	if len(tunnels.stopIDs) != 1 || tunnels.stopIDs[0] != "tunnel-id" {
+		t.Fatalf("stop ids = %#v", tunnels.stopIDs)
+	}
+}
+
+func TestAppTunnelListIsNeverNull(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app, err := NewApp(configPath, newFakeSessions(), newFakePorts(), newFakeTunnels())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tunnels", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"tunnels":[]`) {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestAppRejectsInvalidTunnelRequests(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sessions := newFakeSessions()
+	sessions.states["server-a"] = sshmanager.Snapshot{Host: "server-a", Status: sshmanager.StatusConnected}
+	tunnels := newFakeTunnels()
+	app, err := NewApp(configPath, sessions, newFakePorts(), tunnels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"empty body", ""},
+		{"missing host", `{"remotePort":8080}`},
+		{"blank host", `{"host":" ","remotePort":8080}`},
+		{"missing port", `{"host":"server-a"}`},
+		{"null port", `{"host":"server-a","remotePort":null}`},
+		{"zero port", `{"host":"server-a","remotePort":0}`},
+		{"negative port", `{"host":"server-a","remotePort":-1}`},
+		{"large port", `{"host":"server-a","remotePort":65536}`},
+		{"fraction port", `{"host":"server-a","remotePort":80.5}`},
+		{"unknown field", `{"host":"server-a","remotePort":8080,"localPort":8081}`},
+		{"trailing value", `{"host":"server-a","remotePort":8080}{}`},
+		{"oversized", `{"host":"server-a","remotePort":8080}` + strings.Repeat(" ", 4097)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tunnels", strings.NewReader(test.body)))
+			if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"code":"invalid_request"`) {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if tunnels.createCalls != 0 {
+		t.Fatalf("invalid requests reached service: %d", tunnels.createCalls)
+	}
+}
+
+func TestAppTunnelCreateRequiresKnownConnectedHost(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tunnels := newFakeTunnels()
+	app, err := NewApp(configPath, newFakeSessions(), newFakePorts(), tunnels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		body   string
+		status int
+		code   string
+	}{
+		{"unknown", `{"host":"server-b","remotePort":8080}`, http.StatusNotFound, "host_not_found"},
+		{"disconnected", `{"host":"server-a","remotePort":8080}`, http.StatusConflict, "server_not_connected"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tunnels", strings.NewReader(test.body)))
+			if response.Code != test.status || !strings.Contains(response.Body.String(), test.code) {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if tunnels.createCalls != 0 {
+		t.Fatalf("invalid hosts reached service: %d", tunnels.createCalls)
+	}
+}
+
+func TestAppMapsTunnelErrorsWithoutLeakingDetails(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"invalid", &tunnel.Error{Code: tunnel.ErrorInvalid, Message: "internal detail"}, http.StatusBadRequest, "invalid_tunnel"},
+		{"disconnected", &tunnel.Error{Code: tunnel.ErrorServerNotConnected, Message: "internal detail"}, http.StatusConflict, "server_not_connected"},
+		{"port unavailable", &tunnel.Error{Code: tunnel.ErrorLocalPortUnavailable, Message: "internal detail"}, http.StatusConflict, "local_port_unavailable"},
+		{"timeout", &tunnel.Error{Code: tunnel.ErrorTimeout, Message: "internal detail"}, http.StatusGatewayTimeout, "tunnel_timeout"},
+		{"cancelled", &tunnel.Error{Code: tunnel.ErrorCancelled, Message: "internal detail"}, http.StatusRequestTimeout, "tunnel_cancelled"},
+		{"start failed", &tunnel.Error{Code: tunnel.ErrorStartFailed, Message: "internal detail"}, http.StatusBadGateway, "tunnel_start_failed"},
+		{"closed", &tunnel.Error{Code: tunnel.ErrorServiceClosed, Message: "internal detail"}, http.StatusServiceUnavailable, "service_closed"},
+		{"unknown", errors.New("internal detail"), http.StatusBadGateway, "tunnel_start_failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sessions := newFakeSessions()
+			sessions.states["server-a"] = sshmanager.Snapshot{Host: "server-a", Status: sshmanager.StatusConnected}
+			tunnels := newFakeTunnels()
+			tunnels.createErr = test.err
+			app, err := NewApp(configPath, sessions, newFakePorts(), tunnels)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/tunnels", strings.NewReader(`{"host":"server-a","remotePort":8080}`)))
+			if response.Code != test.status || !strings.Contains(response.Body.String(), test.code) {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+			if strings.Contains(response.Body.String(), "internal detail") {
+				t.Fatal("internal tunnel detail leaked to HTTP response")
+			}
+		})
+	}
+}
+
+func TestAppDisconnectCleansHostInOrder(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	tunnels := newFakeTunnels()
+	tunnels.onStopHost = func(string) { order = append(order, "tunnels") }
+	ports := newFakePorts()
+	ports.onSetAutoRefresh = func(string, bool) { order = append(order, "discovery") }
+	sessions := newFakeSessions()
+	sessions.states["server-a"] = sshmanager.Snapshot{Host: "server-a", Status: sshmanager.StatusConnected}
+	sessions.onDisconnect = func(string) { order = append(order, "ssh") }
+	app, err := NewApp(configPath, sessions, ports, tunnels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/servers/server-a/disconnect", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	if got := strings.Join(order, ","); got != "tunnels,discovery,ssh" {
+		t.Fatalf("cleanup order = %s", got)
 	}
 }

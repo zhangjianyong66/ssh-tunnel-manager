@@ -1,0 +1,37 @@
+package web
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestPageTunnelManagementContracts(t *testing.T) {
+	required := []string{
+		`id="tunnels"`,
+		`<h2 id="tunnels-title">活动隧道</h2>`,
+		`<th>本地映射</th>`,
+		`actionButton('代理'`,
+		`actionButton('重新代理'`,
+		`actionButton('停止'`,
+		`actionButton('清除'`,
+		`navigator.clipboard.writeText(address)`,
+		`window.open('http://' + address + '/'`,
+		`method: 'POST'`,
+		`method: 'DELETE'`,
+		`new Map(tunnelItems.map(item => [tunnelKey(item.host, item.remotePort), item]))`,
+	}
+	for _, fragment := range required {
+		if !strings.Contains(pageHTML, fragment) {
+			t.Errorf("页面缺少隧道管理契约 %q", fragment)
+		}
+	}
+
+	if count := strings.Count(pageHTML, `fetch('/api/tunnels')`); count != 1 {
+		t.Fatalf("每轮加载应只声明一次隧道列表请求，实际为 %d", count)
+	}
+	for _, forbidden := range []string{"beforeunload", "pagehide", "sendBeacon"} {
+		if strings.Contains(pageHTML, forbidden) {
+			t.Errorf("页面不得通过 %s 绑定隧道生命周期", forbidden)
+		}
+	}
+}

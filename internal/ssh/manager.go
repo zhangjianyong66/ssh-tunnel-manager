@@ -33,6 +33,8 @@ const controlMasterReadyTimeout = 15 * time.Second
 
 const commandOutputLimit = 1 << 20
 
+const processCleanupTimeout = 2 * time.Second
+
 // ErrorCode is a stable classification for API consumers.
 type ErrorCode string
 
@@ -116,13 +118,13 @@ func (r RealRunner) Start(_ context.Context, spec CommandSpec) (Process, error) 
 	cmd.Dir = spec.Dir
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	stderr := &limitedBuffer{limit: commandOutputLimit}
+	cmd.Stderr = stderr
 	cmd.ExtraFiles = spec.ExtraFiles
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	return &realProcess{cmd: cmd, stderr: &stderr}, nil
+	return &realProcess{cmd: cmd, stderr: stderr}, nil
 }
 
 func (r RealRunner) Run(ctx context.Context, spec CommandSpec) error {
@@ -167,11 +169,14 @@ func (r RealRunner) Output(ctx context.Context, spec CommandSpec) (CommandOutput
 }
 
 type limitedBuffer struct {
+	mu     sync.Mutex
 	buffer bytes.Buffer
 	limit  int
 }
 
 func (b *limitedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	written := len(value)
 	remaining := b.limit - b.buffer.Len()
 	if remaining > 0 {
@@ -183,11 +188,15 @@ func (b *limitedBuffer) Write(value []byte) (int, error) {
 	return written, nil
 }
 
-func (b *limitedBuffer) String() string { return b.buffer.String() }
+func (b *limitedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
 
 type realProcess struct {
 	cmd    *exec.Cmd
-	stderr *bytes.Buffer
+	stderr *limitedBuffer
 }
 
 func (p *realProcess) Wait() error                { return p.cmd.Wait() }
@@ -444,6 +453,100 @@ func (m *Manager) Execute(ctx context.Context, host string, command []string) (C
 		return result, &Error{Code: ErrorTimeout, Message: "远程命令执行超时"}
 	}
 	return result, classifyError(result.Stderr, "远程 SSH 命令执行失败")
+}
+
+// StartLocalForward starts a long-lived local forward through host's existing
+// ControlMaster. The caller owns the returned process and must call Wait once.
+func (m *Manager) StartLocalForward(ctx context.Context, host string, localPort, remotePort uint16) (Process, error) {
+	if err := validateHost(host); err != nil {
+		return nil, &Error{Code: ErrorConfiguration, Message: err.Error()}
+	}
+	if localPort == 0 || remotePort == 0 {
+		return nil, &Error{Code: ErrorConfiguration, Message: "SSH 转发端口无效"}
+	}
+	m.mu.RLock()
+	s := m.sessions[host]
+	m.mu.RUnlock()
+	if s == nil {
+		return nil, &Error{Code: ErrorNotConnected, Message: "SSH 服务器尚未连接"}
+	}
+
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	s.mu.Lock()
+	status, controlPath := s.status, s.controlPath
+	s.mu.Unlock()
+	if status != StatusConnected || controlPath == "" {
+		return nil, &Error{Code: ErrorNotConnected, Message: "SSH 服务器尚未连接"}
+	}
+	runner, ok := m.runner.(oneShotRunner)
+	if !ok {
+		return nil, &Error{Code: ErrorDependency, Message: "SSH 执行器不支持主连接检查"}
+	}
+	check := CommandSpec{Binary: "ssh", Args: []string{"-S", controlPath, "-O", "check", host}}
+	if err := runner.Run(ctx, check); err != nil {
+		return nil, controlCheckError(ctx)
+	}
+
+	localAddress := fmt.Sprintf("127.0.0.1:%d", localPort)
+	remoteAddress := fmt.Sprintf("127.0.0.1:%d", remotePort)
+	args := []string{
+		"-S", controlPath,
+		"-N", "-T",
+		"-o", "BatchMode=yes",
+		"-o", "ExitOnForwardFailure=yes",
+		"-L", localAddress + ":" + remoteAddress,
+		"--", host,
+	}
+	process, err := m.runner.Start(ctx, CommandSpec{Binary: "ssh", Args: args})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, controlCheckError(ctx)
+		}
+		return nil, classifyError(err.Error(), "启动 SSH 本地转发失败")
+	}
+	if err := runner.Run(ctx, check); err != nil {
+		stopUnownedProcess(process)
+		return nil, controlCheckError(ctx)
+	}
+	s.mu.Lock()
+	stillConnected := s.status == StatusConnected && s.controlPath == controlPath
+	s.mu.Unlock()
+	if !stillConnected {
+		stopUnownedProcess(process)
+		return nil, &Error{Code: ErrorNotConnected, Message: "SSH 服务器主连接已断开"}
+	}
+	return process, nil
+}
+
+func controlCheckError(ctx context.Context) *Error {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return &Error{Code: ErrorCancelled, Message: "用户取消了 SSH 本地转发"}
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return &Error{Code: ErrorTimeout, Message: "SSH 本地转发启动超时"}
+	}
+	return &Error{Code: ErrorNotConnected, Message: "SSH 服务器主连接已断开"}
+}
+
+func stopUnownedProcess(process Process) {
+	if process == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = process.Wait()
+		close(done)
+	}()
+	_ = process.Signal(os.Interrupt)
+	timer := time.NewTimer(processCleanupTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return
+	case <-timer.C:
+		_ = process.Signal(os.Kill)
+	}
 }
 
 func (m *Manager) stopSession(ctx context.Context, s *session) {

@@ -10,7 +10,7 @@
 ## OpenSSH 与隧道
 
 - 系统 ssh 是唯一 SSH 协议实现，必须复用用户现有 OpenSSH 配置能力。
-- 端口转发参数应等价于 ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:<local>:127.0.0.1:<remote> <host-alias>，但实际执行必须使用参数数组。
+- M3 端口转发复用既有 ControlMaster，参数应等价于 `ssh -S <control-path> -N -T -o BatchMode=yes -o ExitOnForwardFailure=yes -L 127.0.0.1:<local>:127.0.0.1:<remote> -- <host-alias>`，实际执行必须使用参数数组。Keepalive 与自动重连策略属于 M4，需在主连接层单独设计。
 - 每个连接和隧道由明确句柄管理；禁止用全局进程名匹配停止其他 SSH 会话。
 - SSH 断开后的自动重连应有界并记录状态；不得因一个隧道故障退出整个 Web 服务。
 
