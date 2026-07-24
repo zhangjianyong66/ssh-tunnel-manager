@@ -105,3 +105,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: 完成M2远程端口发现
+
+**Date**: 2026-07-24
+**Task**: 完成M2远程端口发现
+**Branch**: `master`
+
+### Summary
+
+实现复用ControlMaster的远程ss端口发现、回退解析、并发安全快照、10秒自动刷新、M2 API与控制台，并完成race、vet、构建、HTTP和桌面/窄屏冒烟验证。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `50f46b0` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
