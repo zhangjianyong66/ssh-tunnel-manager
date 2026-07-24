@@ -42,8 +42,8 @@
 - [x] 用可控假 SSH 运行时验证转发退出恢复、ControlMaster 退出后的多隧道恢复、认证短路、停止取消和 SIGINT 清理。
 - [x] 更新 README、产品设计、架构、路线图、根 `AGENTS.md` 和 `.trellis/spec/backend`，明确 M4 已实现契约与新的 `internal/preference` 目录。
 - [x] 执行完整质量门禁和差异审查，重点检查秘密、ControlPath、配置权限、非回环监听、goroutine/计时器/子进程泄漏和 API 兼容。
-- [ ] 按中文 Conventional Commits 提交 M4，不推送远端，除非用户另行要求。
-- [ ] 归档 M4 子任务并记录开发 journal；保留父 MVP 与 M5 为规划状态。
+- [x] 按中文 Conventional Commits 提交 M4，不推送远端，除非用户另行要求。
+- [x] 归档 M4 子任务并记录开发 journal；保留父 MVP 与 M5 为规划状态。
 
 ## 全量验证门禁
 
