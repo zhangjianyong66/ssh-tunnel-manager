@@ -10,7 +10,9 @@ const pageHTML = `<!doctype html>
     :root { color-scheme: light; font-family: system-ui, sans-serif; }
     * { box-sizing: border-box; }
     body { max-width: 1120px; margin: 36px auto; padding: 0 20px; color: #1f2937; }
-    header { border-bottom: 1px solid #e5e7eb; margin-bottom: 22px; }
+    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; border-bottom: 1px solid #e5e7eb; margin-bottom: 22px; }
+    .header-copy { min-width: 0; }
+    .header-actions { padding-top: 16px; }
     h1 { margin-bottom: 8px; font-size: 28px; letter-spacing: 0; }
     h2 { margin: 0 0 10px; font-size: 19px; letter-spacing: 0; }
     .muted { color: #6b7280; }
@@ -57,6 +59,8 @@ const pageHTML = `<!doctype html>
     .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
     @media (max-width: 640px) {
       body { margin-top: 20px; padding: 0 12px; }
+      header { align-items: center; }
+      .header-actions { padding-top: 0; }
       th, td { padding: 9px 6px; }
       .hosts-table { min-width: 100%; table-layout: fixed; }
       .hosts-table > thead th:nth-child(1) { width: 34%; }
@@ -74,8 +78,11 @@ const pageHTML = `<!doctype html>
 </head>
 <body>
   <header>
-    <h1>SSH 隧道管理器</h1>
-    <p class="muted">管理本机 OpenSSH 服务器连接、远程监听端口与本地转发。</p>
+    <div class="header-copy">
+      <h1>SSH 隧道管理器</h1>
+      <p class="muted">管理本机 OpenSSH 服务器连接、远程监听端口与本地转发。</p>
+    </div>
+    <div class="header-actions"><button type="button" id="shutdown" class="danger">退出程序</button></div>
   </header>
   <div class="toolbar">
     <button type="button" id="refresh">刷新 Host</button>
@@ -630,6 +637,22 @@ const pageHTML = `<!doctype html>
       const response = await fetch('/api/ssh-hosts/refresh', { method: 'POST' });
       if (!response.ok) showError(await responseJSON(response));
       await load();
+    };
+    document.getElementById('shutdown').onclick = async event => {
+      if (!window.confirm('退出程序将停止所有 SSH 隧道，是否继续？')) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      button.textContent = '退出中...';
+      error.textContent = '';
+      try {
+        const response = await fetch('/api/shutdown', { method: 'POST' });
+        if (!response.ok) throw await responseJSON(response);
+        announce('程序正在退出');
+      } catch (value) {
+        button.disabled = false;
+        button.textContent = '退出程序';
+        showError(value);
+      }
     };
     load();
     setInterval(load, 10000);

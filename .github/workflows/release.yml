@@ -1,0 +1,76 @@
+name: Linux 发布
+
+"on":
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 检查并发布
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 安装 Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 检查格式
+        run: test -z "$(gofmt -l ./cmd ./internal)"
+
+      - name: 运行竞态测试
+        run: go test -race ./...
+
+      - name: 运行静态检查
+        run: go vet ./...
+
+      - name: 验证常规构建
+        run: go build ./cmd/ssh-tunnel-manager
+
+      - name: 验证安装和卸载
+        run: ./scripts/test-packaging.sh
+
+      - name: 构建并验证发布包
+        run: ./scripts/test-release.sh "$GITHUB_REF_NAME"
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag=$GITHUB_REF_NAME
+          release_version=${tag#v}
+          amd64_archive="dist/ssh-tunnel-manager_${release_version}_linux_amd64.tar.gz"
+          arm64_archive="dist/ssh-tunnel-manager_${release_version}_linux_arm64.tar.gz"
+          checksums="dist/checksums.txt"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --draft
+            gh release upload "$tag" "$amd64_archive" "$arm64_archive" "$checksums" --clobber
+          else
+            gh release create "$tag" \
+              "$amd64_archive" \
+              "$arm64_archive" \
+              "$checksums" \
+              --verify-tag \
+              --draft \
+              --generate-notes \
+              --title "SSH 隧道管理器 $tag"
+          fi
+
+          gh release edit "$tag" --draft=false

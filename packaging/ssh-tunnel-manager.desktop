@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SSH 隧道管理器
+Comment=管理本地 SSH 连接和端口转发
+Exec=@EXEC@ --open-browser
+Icon=network-server
+Terminal=false
+Categories=Network;Utility;
+StartupNotify=false

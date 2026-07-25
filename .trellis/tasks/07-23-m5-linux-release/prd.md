@@ -2,18 +2,42 @@
 
 ## Goal
 
-TBD.
+让 Linux 用户可以获得可验证的 SSH 隧道管理器发布产物，并通过安装脚本完成本地命令和桌面入口安装。
+
+## 已确认背景
+
+- 项目使用 Go 1.22 或更高版本，当前入口为 `cmd/ssh-tunnel-manager`，部署形态是单文件 Linux 可执行程序。
+- 第一版面向 Ubuntu/Linux 本地环境，Web 服务和隧道端口必须继续只监听 `127.0.0.1`。
+- 当前仓库没有发布流水线、安装脚本、桌面入口或 systemd 配置；M5 需要新增交付文件并保持现有运行边界。
+- 路线图明确要求 Linux amd64/arm64 构建、安装脚本、用户级桌面入口，以及 `go test ./...`、`go vet ./...`、构建和安全回归测试。
 
 ## Requirements
 
-- TBD
+- 提供可重复执行的 Linux amd64 和 arm64 发布构建。
+- 安装范围固定为当前用户：可执行文件安装到 `${XDG_BIN_HOME:-~/.local/bin}`，桌面入口安装到 `${XDG_DATA_HOME:-~/.local/share}/applications`，解析后的目标路径必须位于当前用户 HOME 下，全程不需要 `sudo`。
+- 提供可重复执行的安装、覆盖升级和卸载能力；卸载不得删除用户配置、SSH 配置或 Secret Service 中的凭据。
+- 提供用户级桌面入口，安装过程不得把本地服务暴露到非回环地址，也不创建 systemd 服务。
+- 程序新增显式 `--open-browser` 参数；桌面入口使用该参数并隐藏终端，命令行直接启动的默认行为保持不变。
+- 自动打开浏览器失败不得终止本地服务，程序仍输出可手动访问的带令牌地址。
+- 控制台提供经过现有随机令牌认证的退出操作，使隐藏终端的桌面启动仍可触发原有优雅关闭流程。
+- 提供 GitHub Actions 发布流程：推送 `v*` 版本标签时先执行质量检查，再构建 Linux amd64/arm64 压缩包、生成 SHA-256 校验文件并创建 GitHub Release。
+- 自动发布失败不得产生缺少质量门禁或缺少校验文件的正式 Release。
+- 发布前执行测试、静态检查、构建和安全回归，并记录可复现的验证方式。
+- 不在发布产物或安装流程中保存密码、私钥口令等敏感信息。
 
 ## Acceptance Criteria
 
-- [ ] TBD
+- [x] 在干净环境中可生成 amd64/arm64 可执行文件，并能识别目标架构。
+- [x] 每个版本压缩包包含可执行文件、安装/卸载脚本、桌面入口模板、README 和 LICENSE，并有对应 SHA-256 校验信息。
+- [x] 安装和卸载脚本可重复执行，安装后命令和桌面入口指向正确版本，卸载或覆盖不会误删用户配置和凭据。
+- [x] 桌面入口只启动本地程序，不增加 systemd、容器或公网监听配置。
+- [x] 从桌面入口启动时自动打开默认浏览器；浏览器启动失败时服务仍可正常访问，命令行默认启动不会自动打开浏览器。
+- [x] 用户可从控制台明确退出程序，未认证请求不能触发退出，退出仍按隧道、端口发现、SSH、HTTP 的既有顺序清理。
+- [x] `go test -race ./...`、`go vet ./...`、`go build ./cmd/ssh-tunnel-manager` 及安全回归检查通过。
+- [x] 发布文档说明构建、安装、运行和回滚步骤，且不要求修改 `~/.ssh/config`。
+- [x] GitHub Actions 只由 `v*` 标签触发发布，质量检查成功后才创建 Release；普通分支推送不会发布。
 
-## Notes
+## Out of Scope
 
-- Keep `prd.md` focused on requirements, constraints, and acceptance criteria.
-- Lightweight tasks can remain PRD-only.
-- For complex tasks, add `design.md` for technical design and `implement.md` for execution planning before `task.py start`.
+- macOS/Windows 构建和密钥环适配。
+- 系统级安装、系统级服务管理、自动开机启动和包管理器仓库发布。

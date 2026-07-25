@@ -27,6 +27,9 @@ func TestPageTunnelManagementContracts(t *testing.T) {
 		`window.open('http://' + address + '/'`,
 		`method: 'POST'`,
 		`method: 'DELETE'`,
+		`id="shutdown"`,
+		`fetch('/api/shutdown', { method: 'POST' })`,
+		`退出程序将停止所有 SSH 隧道`,
 		`new Map(tunnelItems.map(item => [tunnelKey(item.host, item.remotePort), item]))`,
 	}
 	for _, fragment := range required {

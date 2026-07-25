@@ -40,7 +40,11 @@ go build ./cmd/ssh-tunnel-manager
 - cmd/ssh-tunnel-manager/main.go 是当前唯一可执行入口；internal/credential 负责 Secret Service，internal/ssh 负责 OpenSSH ControlMaster 生命周期和受控远程命令，internal/portdiscovery 负责 `ss` 解析、端口快照与自动刷新，internal/preference 负责 XDG 非敏感偏好，internal/tunnel 负责回环端口分配、自动重连、隧道状态和精确进程清理，internal/sshconfig 负责 SSH 配置解析，internal/web 负责本地页面和 API；docs/ 保存产品、架构和路线文档。
 - 本地开发使用 go run ./cmd/ssh-tunnel-manager，默认控制台地址为 127.0.0.1:8765；构建使用 go build -o ssh-tunnel-manager ./cmd/ssh-tunnel-manager。
 - 测试文件与对应 Go 包同目录；涉及并发连接、端口刷新或生命周期的变更必须运行 `go test -race ./...`，并继续运行 `go vet ./...` 和构建命令。
-- 当前部署是直接运行单文件 Linux 可执行程序，没有安装脚本、systemd 单元或容器暴露配置；不得通过部署配置把回环服务暴露到局域网或公网。
+- 当前部署仍是直接运行单文件 Linux 可执行程序，M5 提供用户级安装脚本和桌面入口，但不提供 systemd 单元或容器暴露配置；不得通过部署配置把回环服务暴露到局域网或公网。
+- Linux 发布由 `scripts/build-release.sh <version>` 统一构建 amd64/arm64 压缩包与 `dist/checksums.txt`；`scripts/test-release.sh` 验证版本、包内容、SHA-256 和 ELF 架构，`dist/` 不进入 Git。
+- 发布包通过 `packaging/install.sh` 无 `sudo` 安装到 `${XDG_BIN_HOME:-~/.local/bin}`，桌面入口安装到 `${XDG_DATA_HOME:-~/.local/share}/applications`；卸载保留 SSH 配置、自动刷新偏好和 Secret Service 凭据，不提供系统级安装或 systemd 服务。
+- `.github/workflows/release.yml` 只在 `v*` 标签上执行完整质量门禁和 Linux 自动发布；本地开发不得在未获明确授权时创建或推送版本标签、发布 GitHub Release。
+- 桌面入口使用 `--open-browser` 自动打开控制台，浏览器失败不终止服务；隐藏终端启动时通过控制台右上角的认证退出操作触发原有优雅关闭，关闭浏览器页面本身仍不停止程序。
 - SSH 连接运行目录创建在 `${XDG_RUNTIME_DIR:-系统临时目录}/ssh-tunnel-manager-*`，权限为 `0700`，每个 Host 使用独立短 ControlPath；程序退出或显式断开时清理。
 - 端口发现和本地转发只复用已经连接的 ControlMaster；断开 Host 时先停止该 Host 的隧道，再停止自动刷新，最后断开 SSH。程序退出时依次关闭 `internal/tunnel`、`internal/portdiscovery`、SSH 会话和 HTTP 服务。
 - 凭据持久化通过 Go D-Bus 客户端访问 Linux Secret Service/GNOME Keyring；没有可用会话时不得降级为明文存储。

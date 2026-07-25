@@ -7,7 +7,7 @@
 - 启动阶段的致命错误使用 log.Fatalf，例如 newToken() 失败或请求监听非回环地址（cmd/ssh-tunnel-manager/main.go）。这类错误发生在服务启动前，程序应直接退出。
 - HTTP 请求中的授权失败使用 http.Error 返回 401 Unauthorized，正文保持简短，不回显用户输入或令牌。
 - 页面模板渲染失败记录错误，但不把内部错误堆栈写入响应；参考 pageTemplate.Execute 的处理。
-- http.ListenAndServe 返回错误时使用 log.Fatal 结束进程。未来引入可关闭的 http.Server 时，正常退出产生的 http.ErrServerClosed 不应被当成异常记录。
+- HTTP 服务先使用 net.Listen 同步绑定，失败时在输出或打开令牌 URL 前退出；成功后由可关闭的 http.Server.Serve 运行，正常退出产生的 http.ErrServerClosed 不作为异常记录。
 
 ## 错误传播规则
 

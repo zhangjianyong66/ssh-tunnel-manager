@@ -7,10 +7,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -30,11 +32,25 @@ const (
 	cookieName  = "stm_token"
 )
 
+var version = "dev"
+
+type options struct {
+	addr        string
+	openBrowser bool
+	showVersion bool
+}
+
 func main() {
-	addr := flag.String("addr", defaultAddr, "本地 Web 服务监听地址（必须是回环地址）")
-	flag.Parse()
-	if !isLoopbackAddr(*addr) {
-		log.Fatalf("拒绝监听非回环地址: %s", *addr)
+	opts, err := parseOptions(os.Args[1:], os.Stderr)
+	if err != nil {
+		os.Exit(2)
+	}
+	if opts.showVersion {
+		fmt.Fprintln(os.Stdout, version)
+		return
+	}
+	if !isLoopbackAddr(opts.addr) {
+		log.Fatalf("拒绝监听非回环地址: %s", opts.addr)
 	}
 	token, err := newToken()
 	if err != nil {
@@ -71,24 +87,27 @@ func main() {
 		log.Fatalf("初始化 Web 控制台失败: %v", err)
 	}
 
+	stopContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	mux.Handle("POST /api/shutdown", shutdownHandler(token, stop))
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !authorize(w, r, token) {
 			return
 		}
 		app.Handler().ServeHTTP(w, r)
 	}))
-	server := &http.Server{Addr: *addr, Handler: mux}
-	stopContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	serverErr := make(chan error, 1)
-	go func() { serverErr <- server.ListenAndServe() }()
-	fmt.Fprintf(os.Stdout, "SSH 隧道管理器已启动\n控制台: http://%s/?token=%s\n按 Ctrl+C 停止\n", *addr, token)
-	log.Printf("listening on %s", *addr)
+	server := &http.Server{Addr: opts.addr, Handler: mux}
+	consoleURL := fmt.Sprintf("http://%s/?token=%s", opts.addr, token)
+	serverErr, err := startConsole(server, opts.addr, consoleURL, opts.openBrowser, os.Stdout, openBrowser)
+	if err != nil {
+		log.Fatalf("监听本地 Web 服务失败: %v", err)
+	}
+	log.Printf("listening on %s", opts.addr)
 
 	select {
 	case err := <-serverErr:
@@ -100,6 +119,54 @@ func main() {
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	shutdownRuntime(shutdownContext, tunnels, discovery, manager, server)
+}
+
+func shutdownHandler(token string, stop func()) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !authorize(w, r, token) {
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		go stop()
+	})
+}
+
+func parseOptions(args []string, output io.Writer) (options, error) {
+	result := options{addr: defaultAddr}
+	flags := flag.NewFlagSet("ssh-tunnel-manager", flag.ContinueOnError)
+	flags.SetOutput(output)
+	flags.StringVar(&result.addr, "addr", defaultAddr, "本地 Web 服务监听地址（必须是回环地址）")
+	flags.BoolVar(&result.openBrowser, "open-browser", false, "启动后使用默认浏览器打开控制台")
+	flags.BoolVar(&result.showVersion, "version", false, "显示版本并退出")
+	if err := flags.Parse(args); err != nil {
+		return options{}, err
+	}
+	return result, nil
+}
+
+func startConsole(server *http.Server, addr, consoleURL string, shouldOpenBrowser bool, output io.Writer, opener func(string) error) (<-chan error, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- server.Serve(listener) }()
+	fmt.Fprintf(output, "SSH 隧道管理器已启动\n控制台: %s\n按 Ctrl+C 停止\n", consoleURL)
+	if shouldOpenBrowser {
+		if err := opener(consoleURL); err != nil {
+			log.Printf("打开默认浏览器失败: %v", err)
+		}
+	}
+	return serverErr, nil
+}
+
+func openBrowser(rawURL string) error {
+	command := exec.Command("xdg-open", rawURL)
+	if err := command.Start(); err != nil {
+		return fmt.Errorf("启动 xdg-open: %w", err)
+	}
+	go func() { _ = command.Wait() }()
+	return nil
 }
 
 type tunnelCloser interface {

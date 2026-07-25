@@ -13,6 +13,7 @@
 7. 涉及远程 `ss`、端口快照、自动刷新或 M2 API 时，阅读 port-discovery.md。
 8. 涉及本地转发、端口分配、隧道 API/页面或 M3 清理顺序时，阅读 tunnel-management.md。
 9. 涉及自动重连、重连状态、隧道日志、诊断脱敏或自动刷新偏好时，阅读 reliability-and-preferences.md。
+10. 涉及启动参数、桌面退出、安装/卸载、双架构产物或 GitHub Release 时，阅读 release-delivery.md。
 
 ## 规范索引
 
@@ -28,6 +29,7 @@
 | [port-discovery.md](./port-discovery.md) | 受控远程命令、ss 解析、刷新状态和 M2 API 可执行契约 |
 | [tunnel-management.md](./tunnel-management.md) | 回环端口分配、精确进程生命周期、M3 API 和控制台契约 |
 | [reliability-and-preferences.md](./reliability-and-preferences.md) | M4 自动重连、状态、内存日志、偏好持久化和控制台契约 |
+| [release-delivery.md](./release-delivery.md) | M5 启动参数、用户级安装、双架构产物、桌面退出和标签发布契约 |
 
 ## 质量检查
 
