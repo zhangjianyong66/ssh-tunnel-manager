@@ -28,7 +28,7 @@
 
 第一版使用单进程模型：Go 进程同时负责 HTTP 服务、状态管理和 SSH 子进程。每个服务器连接与端口隧道都由明确的句柄管理，不使用全局 `pkill` 或模糊进程匹配。
 
-浏览器刷新或关闭不会影响 Go 进程。程序退出时执行有界的优雅清理，并在异常退出后依靠操作系统回收子进程和监听端口。
+浏览器刷新或关闭不会影响 Go 进程。命令行启动默认只输出带令牌 URL；用户级桌面入口显式传入 `--open-browser`，并且只有在 `net.Listen` 成功后才调用 `xdg-open`。程序退出时执行有界的优雅清理，并在异常退出后依靠操作系统回收子进程和监听端口。
 
 ## 3. OpenSSH 调用
 
@@ -121,7 +121,7 @@ ss -ltn
 
 ## 8. HTTP API
 
-API 仅监听回环地址，所有业务路由都要求令牌 Cookie：
+API 仅监听回环地址，所有业务路由都要求随机令牌认证；首次查询令牌可换取 HttpOnly Cookie，后续请求使用该 Cookie：
 
 ```text
 GET  /api/ssh-hosts
@@ -136,8 +136,17 @@ POST /api/tunnels
 GET  /api/tunnels
 DELETE /api/tunnels/{id}
 GET  /api/tunnels/{id}/logs
+POST /api/shutdown
 ```
 
 写操作应支持请求幂等标识，错误返回结构化错误码；日志 API 必须脱敏。
 
-M1 已实现 Host 刷新、连接、断开和状态查询；M2 已实现端口查询、手动刷新和自动刷新切换；M3 已实现隧道创建、列表和幂等停止；M4 已实现有界自动重连、状态时间、偏好持久化和脱敏日志 API。客户端请求幂等标识仍属于后续工作。
+M1 已实现 Host 刷新、连接、断开和状态查询；M2 已实现端口查询、手动刷新和自动刷新切换；M3 已实现隧道创建、列表和幂等停止；M4 已实现有界自动重连、状态时间、偏好持久化和脱敏日志 API；M5 已实现入口拥有的认证退出 API。退出成功先返回 `202 Accepted`，再取消停止上下文并复用既有清理顺序。客户端请求幂等标识仍属于后续工作。
+
+## 9. Linux 发布与安装
+
+`scripts/build-release.sh <version>` 是本地和 GitHub Actions 共用的发布构建入口，使用 `CGO_ENABLED=0` 分别生成 Linux amd64/arm64 压缩包与 `dist/checksums.txt`。每个压缩包只包含程序、安装/卸载脚本、桌面入口模板、README 和 LICENSE，不包含运行时配置、SSH 文件、日志或凭据。
+
+安装器将程序和卸载命令写入 `${XDG_BIN_HOME:-~/.local/bin}`，将桌面入口写入 `${XDG_DATA_HOME:-~/.local/share}/applications`。HOME 与 XDG 路径规范化后必须位于当前用户 HOME 下；安装不使用 `sudo`，不创建 systemd 服务，卸载不删除配置、SSH 文件或 Secret Service 凭据。
+
+`.github/workflows/release.yml` 只响应 `v*` 标签。完整质量检查和双架构发布回归通过后，工作流先创建或恢复草稿 Release，上传两个压缩包与校验文件，最后才转为正式发布；本地开发和验收不会自动创建标签或修改远端 Release。
