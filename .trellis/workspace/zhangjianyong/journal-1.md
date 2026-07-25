@@ -237,3 +237,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 8: 完成SSH隧道管理器MVP整体验收
+
+**Date**: 2026-07-25
+**Task**: 完成SSH隧道管理器MVP整体验收
+**Branch**: `master`
+
+### Summary
+
+核对M1至M5全部交付，修正产品与架构文档漂移，通过全仓、发布、安全和真实HTTP退出验收，并归档父MVP任务。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `cdce750` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
