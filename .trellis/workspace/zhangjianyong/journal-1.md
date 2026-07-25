@@ -204,3 +204,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 7: 完成M5 Linux发布与交付
+
+**Date**: 2026-07-25
+**Task**: 完成M5 Linux发布与交付
+**Branch**: `master`
+
+### Summary
+
+完成Linux amd64/arm64发布包、用户级安装与桌面入口、认证退出、标签自动发布流程及完整质量回归。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `97434ca` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
