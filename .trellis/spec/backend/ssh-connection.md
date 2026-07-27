@@ -84,3 +84,71 @@ process, err := runner.Start(ctx, spec)
 ```
 
 Host 已在配置快照和连接层校验，秘密只由 askpass 的私有命名管道提供。
+
+## Scenario: M2 项目 Host 跳板链与安全挑战
+
+### 1. Scope / Trigger
+
+- 触发范围：项目 Host 通过 `internal/hostconfig.Catalog` 连接、需要一层 `JumpHost`、临时 OpenSSH 配置、分阶段凭据或主机指纹确认时。
+- 目标：每个会话冻结一份私有配置；先连接跳板 ControlMaster，再由目标的 `ProxyJump` 复用跳板，不把两阶段秘密混用。
+
+### 2. Signatures
+
+- `NewManager(runner Runner, store credential.Store, runtimeDir string, sources ...any) (*Manager, error)`；`sources` 可实现 `ConfigSource`、`JumpResolver`、`UsernameResolver`。
+- `ConfigSource.Render() ([]byte, error)`；Manager 将结果写入会话目录 `ssh_config`，不会修改用户 `~/.ssh/config`。
+- `JumpResolver.JumpHost(context.Context, string) (string, error)`；`UsernameResolver.Username(context.Context, string) (string, error)`。
+- `ConnectOptions` 增加 `StageHost`、`ConfirmFingerprint`；HTTP 连接请求增加 `stageHost`、`confirmFingerprint`。
+- SSH 错误码增加 `host_key_confirmation_required`、`host_key_changed`、`host_in_use`；安全详情只包含 `stageHost` 和 `fingerprint`。
+
+### 3. Contracts
+
+- 会话目录和配置文件权限分别为 `0700`、`0600`；主连接、`-O check`、`-O exit`、远程命令和本地转发在有配置源时都使用同一绝对 `-F <session-config>`。
+- 目标会话的临时配置在跳板 Host 段前置 `ControlMaster auto` 和已连接跳板的精确 `ControlPath`，随后使用结构化 `ProxyJump`；禁止拼接 `ProxyCommand` shell 字符串。
+- 项目 Host 连接顺序为 `jump -> target`。跳板凭据只用于 `StageHost=jump`，目标凭据只用于 `StageHost=target`；凭据查找使用各自 Host 别名和有效用户名。
+- 首次未知指纹返回 `host_key_confirmation_required`、`stageHost`、`fingerprint`；确认重试必须匹配该阶段待确认指纹。变化密钥返回 `host_key_changed`，不接受覆盖。
+- 已连接目标依赖跳板时，显式断开跳板返回 `host_in_use`；Manager 退出按依赖目标在前、跳板在后的顺序关闭。
+- 损坏项目配置渲染为空的项目段但保留系统 `Include`，系统 Host 仍可只读连接；项目 CRUD 和无效引用继续报配置错误。
+- HTTP 响应不得包含密码、私钥口令、`ControlPath`、临时配置内容或原始 SSH 诊断。
+
+### 4. Validation & Error Matrix
+
+| 条件 | 错误码 / HTTP |
+|---|---|
+| 阶段 Host 与当前连接目标不匹配 | `configuration` 或 `host_key_changed` / 400 或 409 |
+| 未知指纹 | `host_key_confirmation_required` / 409，详情含阶段和指纹 |
+| 已知指纹变化 | `host_key_changed` / 409，禁止自动接受 |
+| 跳板仍有已连接目标 | `host_in_use` / 409 |
+| 跳板引用无效或多层 | `configuration` / `host_reference_broken` |
+| Secret Service 不可用且请求保存凭据 | `local_dependency_missing` / 503 |
+
+### 5. Good/Base/Bad Cases
+
+- Good：`mac_home` 先建立 ControlMaster，`ssh_ubuntu_home` 的 `ProxyJump mac_home` 使用目标配置中的跳板 `ControlPath`，两个阶段可使用不同用户名和秘密。
+- Base：没有项目 Host 或项目文件损坏时，系统 Host 仍使用只读系统配置；启动过程不自动连接。
+- Bad：把密码放到 SSH 参数、环境变量、临时配置、普通文件或 HTTP 错误；用 `pkill ssh`、模糊进程名或一个全局 askpass 停止/路由两个 Host。
+
+### 6. Tests Required
+
+- `internal/ssh`：断言每个会话配置 `0700/0600`、所有命令复用同一 `-F`、目标配置固定跳板 ControlPath、跳板先于目标启动。
+- `internal/ssh`：断言跳板凭据不会出现在目标 askpass/命令环境，凭据 Ref 分别使用跳板和目标用户名。
+- `internal/ssh`：覆盖未知指纹提取、严格确认匹配、变化密钥拒绝、断开门禁和退出拓扑顺序。
+- `internal/web`：断言阶段请求字段严格解码、错误详情只含 `stageHost`/指纹，响应不回显秘密或诊断。
+- 全量质量门禁：`gofmt -w ./cmd ./internal`、`go test -race ./...`、`go vet ./...`、`go build ./cmd/ssh-tunnel-manager`。
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```go
+exec.Command("sh", "-c", "ssh -J "+jump+" "+target)
+```
+
+这会把用户输入送进 shell，并且无法把跳板和目标的凭据、ControlPath、生命周期分开。
+
+#### Correct
+
+```go
+args := withConfig(sessionConfig, "-S", targetControlPath, "-N", "-T", "-o", "BatchMode=yes", "--", target)
+```
+
+目标配置通过 `ProxyJump` 复用已连接跳板，参数保持数组形式，秘密仍只通过当前阶段的受限 askpass 通道传递。

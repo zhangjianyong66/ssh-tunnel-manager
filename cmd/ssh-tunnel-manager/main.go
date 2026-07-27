@@ -63,15 +63,6 @@ func main() {
 	}
 	defer os.RemoveAll(runtimeDir)
 	credentials := credential.NewSecretServiceStore()
-	manager, err := sshmanager.NewManager(sshmanager.RealRunner{}, credentials, runtimeDir)
-	if err != nil {
-		log.Fatalf("初始化 SSH 管理器失败: %v", err)
-	}
-	discovery, err := portdiscovery.NewService(manager)
-	if err != nil {
-		log.Fatalf("初始化端口发现服务失败: %v", err)
-	}
-	tunnels := tunnel.NewManager(manager, manager)
 	var preferences preference.Store
 	preferencePath, preferencePathErr := preference.DefaultPath()
 	if preferencePathErr != nil {
@@ -100,6 +91,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("初始化 SSH Host 配置失败: %v", err)
 	}
+	manager, err := sshmanager.NewManager(sshmanager.RealRunner{}, credentials, runtimeDir, catalog)
+	if err != nil {
+		log.Fatalf("初始化 SSH 管理器失败: %v", err)
+	}
+	discovery, err := portdiscovery.NewService(manager)
+	if err != nil {
+		log.Fatalf("初始化端口发现服务失败: %v", err)
+	}
+	tunnels := tunnel.NewManager(manager, manager)
 	app, err := web.NewAppWithCatalog(catalog, credentials, manager, discovery, tunnels, preferences)
 	if err != nil {
 		log.Fatalf("初始化 Web 控制台失败: %v", err)

@@ -101,10 +101,12 @@ type multiProcessRunner struct {
 	mu        sync.Mutex
 	processes map[string]*fakeProcess
 	starts    map[string]int
+	specs     map[string][]CommandSpec
+	runs      []CommandSpec
 }
 
 func newMultiProcessRunner() *multiProcessRunner {
-	return &multiProcessRunner{processes: make(map[string]*fakeProcess), starts: make(map[string]int)}
+	return &multiProcessRunner{processes: make(map[string]*fakeProcess), starts: make(map[string]int), specs: make(map[string][]CommandSpec)}
 }
 
 func (r *multiProcessRunner) Start(_ context.Context, spec CommandSpec) (Process, error) {
@@ -114,10 +116,28 @@ func (r *multiProcessRunner) Start(_ context.Context, spec CommandSpec) (Process
 	process := newFakeProcess()
 	r.processes[host] = process
 	r.starts[host]++
+	r.specs[host] = append(r.specs[host], spec)
 	return process, nil
 }
 
-func (r *multiProcessRunner) Run(_ context.Context, _ CommandSpec) error { return nil }
+func (r *multiProcessRunner) Run(_ context.Context, spec CommandSpec) error {
+	r.mu.Lock()
+	r.runs = append(r.runs, spec)
+	r.mu.Unlock()
+	return nil
+}
+
+type fakeConfigSource struct{ value []byte }
+
+func (s fakeConfigSource) Render() ([]byte, error) { return append([]byte(nil), s.value...), nil }
+
+type fakeJumpResolver map[string]string
+
+func (r fakeJumpResolver) JumpHost(context.Context, string) (string, error) { return r["target"], nil }
+
+func (r fakeJumpResolver) Username(_ context.Context, host string) (string, error) {
+	return r["username:"+host], nil
+}
 
 type unavailableCredentialStore struct{}
 
@@ -591,6 +611,8 @@ func TestClassifyErrorMatrix(t *testing.T) {
 		want       ErrorCode
 	}{
 		{"Host key verification failed", ErrorHostKey},
+		{"The authenticity of host 'example' can't be established. SHA256:abcDEF123+/=", ErrorHostKeyConfirmation},
+		{"REMOTE HOST IDENTIFICATION HAS CHANGED", ErrorHostKeyChanged},
 		{"Permission denied (publickey,password)", ErrorAuthentication},
 		{"connect to host example port 22: No route to host", ErrorNetwork},
 		{"Connection timed out", ErrorTimeout},
@@ -612,5 +634,127 @@ func TestRealProcessDiagnosticsRedactsControlPath(t *testing.T) {
 	diagnostic := process.Diagnostics()
 	if strings.Contains(diagnostic, controlPath) || !strings.Contains(diagnostic, "[已隐藏]") {
 		t.Fatalf("diagnostic was not redacted: %q", diagnostic)
+	}
+}
+
+func TestManagerProjectSessionUsesOnePrivateConfigForCommands(t *testing.T) {
+	runner := &fakeRunner{process: newFakeProcess()}
+	config := fakeConfigSource{value: []byte("Host managed\n    HostName example.test\n")}
+	manager, err := NewManager(runner, nil, t.TempDir(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Connect(context.Background(), "managed", ConnectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.specs) == 0 || len(runner.specs[0].Args) < 2 || runner.specs[0].Args[0] != "-F" {
+		t.Fatalf("master args missing -F: %#v", runner.specs)
+	}
+	configPath := runner.specs[0].Args[1]
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("config mode = %o", info.Mode().Perm())
+	}
+	if _, err := manager.Execute(context.Background(), "managed", []string{"true"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range runner.runs {
+		if len(spec.Args) < 2 || spec.Args[0] != "-F" || spec.Args[1] != configPath {
+			t.Fatalf("command did not reuse session config %q: %#v", configPath, spec.Args)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _ = manager.Disconnect(ctx, "managed")
+}
+
+func TestManagerConnectsManagedJumpBeforeTargetAndPinsControlPath(t *testing.T) {
+	runner := newMultiProcessRunner()
+	config := fakeConfigSource{value: []byte("Host jump\n    HostName jump.test\n\nHost target\n    HostName target.test\n    ProxyJump jump\n")}
+	store := &recordingCredentialStore{values: make(map[credential.Ref]string)}
+	manager, err := NewManager(runner, store, t.TempDir(), config, fakeJumpResolver{"target": "jump", "username:jump": "alice", "username:target": "bob"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.Connect(context.Background(), "target", ConnectOptions{})
+	if err != nil || snapshot.Status != StatusConnected {
+		t.Fatalf("target connect = %#v, %v", snapshot, err)
+	}
+	if runner.starts["jump"] != 1 || runner.starts["target"] != 1 {
+		t.Fatalf("starts = %#v", runner.starts)
+	}
+	store.mu.Lock()
+	refs := append([]credential.Ref(nil), store.lookups...)
+	store.mu.Unlock()
+	seen := make(map[credential.Ref]bool)
+	for _, ref := range refs {
+		seen[ref] = true
+	}
+	if !seen[credential.Ref{Host: "jump", Username: "alice", Purpose: "password"}] || !seen[credential.Ref{Host: "target", Username: "bob", Purpose: "password"}] {
+		t.Fatalf("credential lookups did not stay stage-specific: %#v", refs)
+	}
+	jumpArgs := runner.specs["jump"][0].Args
+	targetArgs := runner.specs["target"][0].Args
+	if jumpArgs[0] != "-F" || targetArgs[0] != "-F" {
+		t.Fatalf("missing session config: jump=%#v target=%#v", jumpArgs, targetArgs)
+	}
+	targetConfig, err := os.ReadFile(targetArgs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jumpControlPath string
+	for _, arg := range runner.specs["jump"][0].Args {
+		if strings.HasPrefix(arg, "ControlPath=") {
+			jumpControlPath = strings.TrimPrefix(arg, "ControlPath=")
+		}
+	}
+	if jumpControlPath == "" || !strings.Contains(string(targetConfig), "ControlPath \""+jumpControlPath+"\"") {
+		t.Fatalf("target config did not pin jump ControlPath: %s", targetConfig)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := manager.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagerProtectsConnectedDependentsAndClosesTargetBeforeJump(t *testing.T) {
+	runner := newMultiProcessRunner()
+	runtimeDir, err := os.MkdirTemp("", "m2-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(runtimeDir)
+	manager, err := NewManager(runner, nil, runtimeDir, fakeConfigSource{value: []byte("Host jump\nHost target\n")}, fakeJumpResolver{"target": "jump"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Connect(context.Background(), "target", ConnectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Disconnect(context.Background(), "jump"); err == nil {
+		t.Fatal("disconnecting a jump with a connected dependent succeeded")
+	} else {
+		var sshErr *Error
+		if !errors.As(err, &sshErr) || sshErr.Code != ErrorHostInUse {
+			t.Fatalf("disconnect error = %#v", err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := manager.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var exits []string
+	for _, spec := range runner.runs {
+		if containsArg(spec.Args, "exit") {
+			exits = append(exits, spec.Args[len(spec.Args)-1])
+		}
+	}
+	if len(exits) < 2 || exits[0] != "target" || exits[1] != "jump" {
+		t.Fatalf("close order = %#v", exits)
 	}
 }

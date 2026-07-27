@@ -12,15 +12,17 @@ import (
 // askpass passes secrets through private named pipes. The helper script and
 // environment contain only paths; secret values remain in process memory.
 type askpass struct {
-	dir    string
-	script string
-	done   chan struct{}
-	once   sync.Once
-	wg     sync.WaitGroup
+	dir         string
+	script      string
+	fingerprint string
+	confirm     bool
+	done        chan struct{}
+	once        sync.Once
+	wg          sync.WaitGroup
 }
 
-func newAskpass(password, passphrase string) (*askpass, error) {
-	if password == "" && passphrase == "" {
+func newAskpass(password, passphrase string, confirmation ...string) (*askpass, error) {
+	if password == "" && passphrase == "" && len(confirmation) == 0 {
 		return &askpass{}, nil
 	}
 	dir, err := os.MkdirTemp("", "stm-askpass-")
@@ -32,12 +34,16 @@ func newAskpass(password, passphrase string) (*askpass, error) {
 		return nil, err
 	}
 	script := filepath.Join(dir, "askpass.sh")
-	content := "#!/bin/sh\nbase=${0%/*}\ncase \"$1\" in\n  *passphrase*|*Passphrase*) cat \"$base/passphrase\" ;;\n  *password*|*Password*) cat \"$base/password\" ;;\n  *) exit 1 ;;\nesac\n"
+	fingerprint := ""
+	if len(confirmation) > 0 {
+		fingerprint = confirmation[0]
+	}
+	content := "#!/bin/sh\nbase=${0%/*}\nprompt=$1\ncase \"$prompt\" in\n  *passphrase*|*Passphrase*) cat \"$base/passphrase\" ;;\n  *password*|*Password*) cat \"$base/password\" ;;\n  *authenticity*|*Authenticity*|*yes/no*|*fingerprint*|*Fingerprint*)\n    if [ \"${STM_HOST_KEY_CONFIRM:-}\" = yes ] && [ -n \"${STM_HOST_KEY_FINGERPRINT:-}\" ] && printf '%s' \"$prompt\" | grep -F -- \"$STM_HOST_KEY_FINGERPRINT\" >/dev/null 2>&1; then printf '%s\\n' yes; else printf '%s\\n' no; fi ;;\n  *) exit 1 ;;\nesac\n"
 	if err := os.WriteFile(script, []byte(content), 0o700); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	a := &askpass{dir: dir, script: script, done: make(chan struct{})}
+	a := &askpass{dir: dir, script: script, fingerprint: fingerprint, confirm: fingerprint != "", done: make(chan struct{})}
 	for name, secret := range map[string]string{"password": password, "passphrase": passphrase} {
 		path := filepath.Join(dir, name)
 		if err := syscall.Mkfifo(path, 0o600); err != nil {
@@ -76,7 +82,11 @@ func (a *askpass) Env() []string {
 	if a == nil || a.script == "" {
 		return nil
 	}
-	return []string{"SSH_ASKPASS=" + a.script, "SSH_ASKPASS_REQUIRE=force", "DISPLAY=stm"}
+	env := []string{"SSH_ASKPASS=" + a.script, "SSH_ASKPASS_REQUIRE=force", "DISPLAY=stm"}
+	if a.confirm {
+		env = append(env, "STM_HOST_KEY_CONFIRM=yes", "STM_HOST_KEY_FINGERPRINT="+a.fingerprint)
+	}
+	return env
 }
 
 func (a *askpass) ExtraFiles() []*os.File { return nil }

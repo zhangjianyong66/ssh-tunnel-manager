@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -39,23 +41,28 @@ const processCleanupTimeout = 2 * time.Second
 type ErrorCode string
 
 const (
-	ErrorConfiguration      ErrorCode = "configuration"
-	ErrorAuthentication     ErrorCode = "authentication_failed"
-	ErrorHostKey            ErrorCode = "host_key_verification"
-	ErrorNetwork            ErrorCode = "network_unreachable"
-	ErrorTimeout            ErrorCode = "timeout"
-	ErrorCredentialRequired ErrorCode = "credential_required"
-	ErrorDependency         ErrorCode = "local_dependency_missing"
-	ErrorCancelled          ErrorCode = "user_cancelled"
-	ErrorProcess            ErrorCode = "process_failed"
-	ErrorNotConnected       ErrorCode = "server_not_connected"
+	ErrorConfiguration       ErrorCode = "configuration"
+	ErrorAuthentication      ErrorCode = "authentication_failed"
+	ErrorHostKey             ErrorCode = "host_key_verification"
+	ErrorHostKeyConfirmation ErrorCode = "host_key_confirmation_required"
+	ErrorHostKeyChanged      ErrorCode = "host_key_changed"
+	ErrorNetwork             ErrorCode = "network_unreachable"
+	ErrorTimeout             ErrorCode = "timeout"
+	ErrorCredentialRequired  ErrorCode = "credential_required"
+	ErrorDependency          ErrorCode = "local_dependency_missing"
+	ErrorCancelled           ErrorCode = "user_cancelled"
+	ErrorProcess             ErrorCode = "process_failed"
+	ErrorNotConnected        ErrorCode = "server_not_connected"
+	ErrorHostInUse           ErrorCode = "host_in_use"
 )
 
 // Error is a user-safe SSH failure with an optional redacted diagnostic.
 type Error struct {
-	Code       ErrorCode `json:"code"`
-	Message    string    `json:"message"`
-	Diagnostic string    `json:"diagnostic,omitempty"`
+	Code        ErrorCode `json:"code"`
+	Message     string    `json:"message"`
+	Diagnostic  string    `json:"diagnostic,omitempty"`
+	StageHost   string    `json:"stageHost,omitempty"`
+	Fingerprint string    `json:"fingerprint,omitempty"`
 }
 
 func (e *Error) Error() string {
@@ -210,11 +217,31 @@ func (p *realProcess) Diagnostics() string {
 // ConnectOptions supplies one-shot authentication input. Values are kept only
 // in this call and are never copied into command arguments or environment.
 type ConnectOptions struct {
-	Username       string
-	Password       string
-	Passphrase     string
-	SavePassword   bool
-	SavePassphrase bool
+	Username           string
+	Password           string
+	Passphrase         string
+	SavePassword       bool
+	SavePassphrase     bool
+	StageHost          string
+	ConfirmFingerprint string
+}
+
+// ConfigSource renders a complete, read-only OpenSSH config for one session.
+// The returned bytes are written to a private 0600 file by Manager.
+type ConfigSource interface {
+	Render() ([]byte, error)
+}
+
+// JumpResolver returns the direct jump alias for a managed Host. An empty
+// result means OpenSSH system configuration is responsible for the chain.
+type JumpResolver interface {
+	JumpHost(context.Context, string) (string, error)
+}
+
+// UsernameResolver supplies the effective project username for credential
+// lookup when the request deliberately omits it.
+type UsernameResolver interface {
+	Username(context.Context, string) (string, error)
 }
 
 // Snapshot is a lock-free representation of a server connection.
@@ -228,19 +255,21 @@ type Snapshot struct {
 }
 
 type session struct {
-	opMu        sync.Mutex
-	mu          sync.Mutex
-	host        string
-	status      Status
-	controlPath string
-	runDir      string
-	process     Process
-	askpass     *askpass
-	done        chan struct{}
-	connectedAt time.Time
-	lastError   *Error
-	diagnostic  string
-	username    string
+	opMu               sync.Mutex
+	mu                 sync.Mutex
+	host               string
+	status             Status
+	controlPath        string
+	configPath         string
+	runDir             string
+	process            Process
+	askpass            *askpass
+	done               chan struct{}
+	connectedAt        time.Time
+	lastError          *Error
+	diagnostic         string
+	username           string
+	pendingFingerprint string
 }
 
 // Manager owns all SSH processes started by the application.
@@ -250,10 +279,13 @@ type Manager struct {
 	runner      Runner
 	credentials credential.Store
 	runtimeDir  string
+	config      ConfigSource
+	resolver    JumpResolver
+	usernames   UsernameResolver
 }
 
 // NewManager creates a manager. runtimeDir is created with restrictive mode.
-func NewManager(runner Runner, store credential.Store, runtimeDir string) (*Manager, error) {
+func NewManager(runner Runner, store credential.Store, runtimeDir string, sources ...any) (*Manager, error) {
 	if runner == nil {
 		runner = RealRunner{}
 	}
@@ -266,7 +298,19 @@ func NewManager(runner Runner, store credential.Store, runtimeDir string) (*Mana
 	if err := os.Chmod(runtimeDir, 0o700); err != nil {
 		return nil, fmt.Errorf("收紧 SSH 运行目录权限: %w", err)
 	}
-	return &Manager{sessions: make(map[string]*session), runner: runner, credentials: store, runtimeDir: runtimeDir}, nil
+	manager := &Manager{sessions: make(map[string]*session), runner: runner, credentials: store, runtimeDir: runtimeDir}
+	for _, source := range sources {
+		if value, ok := source.(ConfigSource); ok {
+			manager.config = value
+		}
+		if value, ok := source.(JumpResolver); ok {
+			manager.resolver = value
+		}
+		if value, ok := source.(UsernameResolver); ok {
+			manager.usernames = value
+		}
+	}
+	return manager, nil
 }
 
 // Snapshot returns the current state for host, or a disconnected snapshot.
@@ -299,10 +343,72 @@ func (m *Manager) Snapshots() []Snapshot {
 	return result
 }
 
-// Connect starts an idempotent ControlMaster process for host.
+// Connect starts an idempotent ControlMaster process for host. When the Host
+// has a managed jump, the jump is connected first and its credentials are
+// never reused for the target stage.
 func (m *Manager) Connect(ctx context.Context, host string, opts ConnectOptions) (Snapshot, error) {
 	if err := validateHost(host); err != nil {
 		return Snapshot{Host: host, Status: StatusFailed}, &Error{Code: ErrorConfiguration, Message: err.Error()}
+	}
+	jump := ""
+	if m.resolver != nil {
+		var err error
+		jump, err = m.resolver.JumpHost(ctx, host)
+		if err != nil {
+			return m.failUnknown(host, &Error{Code: ErrorConfiguration, Message: "SSH 跳板配置无效", Diagnostic: sanitizeDiagnostic(err.Error())})
+		}
+	}
+	if jump != "" && jump != host && m.Snapshot(jump).Status != StatusConnected {
+		jumpOptions := ConnectOptions{}
+		if opts.StageHost == "" || opts.StageHost == jump {
+			jumpOptions = opts
+			jumpOptions.StageHost = ""
+		}
+		if _, err := m.connectSingle(ctx, jump, jumpOptions, ""); err != nil {
+			return m.Snapshot(host), withStage(err, jump)
+		}
+		if opts.StageHost == jump || opts.StageHost == "" {
+			opts.Password = ""
+			opts.Passphrase = ""
+			opts.Username = ""
+			opts.ConfirmFingerprint = ""
+			opts.SavePassword = false
+			opts.SavePassphrase = false
+		}
+	}
+	if opts.StageHost != "" && opts.StageHost != host {
+		opts.Password = ""
+		opts.Passphrase = ""
+		opts.Username = ""
+		opts.ConfirmFingerprint = ""
+		opts.SavePassword = false
+		opts.SavePassphrase = false
+	}
+	return m.connectSingle(ctx, host, opts, jump)
+}
+
+func (m *Manager) failUnknown(host string, err *Error) (Snapshot, error) {
+	return Snapshot{Host: host, Status: StatusFailed, LastError: err}, err
+}
+
+func withStage(err error, stage string) error {
+	var sshErr *Error
+	if errors.As(err, &sshErr) {
+		copy := *sshErr
+		copy.StageHost = stage
+		return &copy
+	}
+	return &Error{Code: ErrorProcess, Message: "SSH 连接失败", StageHost: stage, Diagnostic: sanitizeDiagnostic(err.Error())}
+}
+
+func (m *Manager) connectSingle(ctx context.Context, host string, opts ConnectOptions, jump string) (Snapshot, error) {
+	if err := validateHost(host); err != nil {
+		return Snapshot{Host: host, Status: StatusFailed}, &Error{Code: ErrorConfiguration, Message: err.Error()}
+	}
+	if opts.Username == "" && m.usernames != nil {
+		if username, err := m.usernames.Username(ctx, host); err == nil {
+			opts.Username = username
+		}
 	}
 	m.mu.Lock()
 	s := m.sessions[host]
@@ -324,6 +430,12 @@ func (m *Manager) Connect(ctx context.Context, host string, opts ConnectOptions)
 		snap := s.snapshot()
 		s.mu.Unlock()
 		return snap, nil
+	}
+	if opts.ConfirmFingerprint != "" {
+		if !fingerprintPattern.MatchString(opts.ConfirmFingerprint) || s.pendingFingerprint == "" || s.pendingFingerprint != opts.ConfirmFingerprint {
+			s.mu.Unlock()
+			return m.fail(s, &Error{Code: ErrorHostKeyChanged, Message: "确认的 SSH 主机指纹与待确认指纹不一致"}, "主机指纹确认不匹配")
+		}
 	}
 	s.status = StatusConnecting
 	s.lastError = nil
@@ -370,12 +482,22 @@ func (m *Manager) Connect(ctx context.Context, host string, opts ConnectOptions)
 		_ = os.RemoveAll(runDir)
 		return m.fail(s, &Error{Code: ErrorDependency, Message: "SSH ControlPath 路径过长"}, "运行目录路径过长")
 	}
-	askpass, err := newAskpass(opts.Password, opts.Passphrase)
+	configPath, err := m.writeSessionConfig(runDir, jump, func() string {
+		if jump == "" {
+			return ""
+		}
+		return m.Snapshot(jump).ControlPath
+	}())
+	if err != nil {
+		_ = os.RemoveAll(runDir)
+		return m.fail(s, &Error{Code: ErrorDependency, Message: "创建 SSH 配置失败"}, sanitizeDiagnostic(err.Error()))
+	}
+	askpass, err := newAskpass(opts.Password, opts.Passphrase, opts.ConfirmFingerprint)
 	if err != nil {
 		_ = os.RemoveAll(runDir)
 		return m.fail(s, &Error{Code: ErrorDependency, Message: "创建 SSH 认证交互通道失败"}, err.Error())
 	}
-	args := []string{"-M", "-N", "-T", "-o", "ControlMaster=yes", "-o", "ControlPersist=no", "-o", "ControlPath=" + controlPath, host}
+	args := m.withConfig(configPath, "-M", "-N", "-T", "-o", "ControlMaster=yes", "-o", "ControlPersist=no", "-o", "ControlPath="+controlPath, host)
 	spec := CommandSpec{Binary: "ssh", Args: args, Env: askpass.Env(), ExtraFiles: askpass.ExtraFiles()}
 	process, err := m.runner.Start(ctx, spec)
 	if err != nil {
@@ -383,9 +505,13 @@ func (m *Manager) Connect(ctx context.Context, host string, opts ConnectOptions)
 		_ = os.RemoveAll(runDir)
 		return m.fail(s, classifyError(err.Error(), "启动 SSH 失败"), sanitizeDiagnostic(err.Error(), opts.Password, opts.Passphrase))
 	}
+	if real, ok := process.(*realProcess); ok {
+		real.secrets = []string{controlPath, configPath, opts.Password, opts.Passphrase}
+	}
 	s.mu.Lock()
 	s.runDir = runDir
 	s.controlPath = controlPath
+	s.configPath = configPath
 	s.process = process
 	s.askpass = askpass
 	s.done = make(chan struct{})
@@ -401,6 +527,7 @@ func (m *Manager) Connect(ctx context.Context, host string, opts ConnectOptions)
 	if s.status == StatusConnecting {
 		s.status = StatusConnected
 		s.connectedAt = time.Now()
+		s.pendingFingerprint = ""
 	}
 	snapshot := s.snapshot()
 	s.mu.Unlock()
@@ -412,6 +539,9 @@ func (m *Manager) Connect(ctx context.Context, host string, opts ConnectOptions)
 
 // Disconnect gracefully stops host's process and removes its private runtime files.
 func (m *Manager) Disconnect(ctx context.Context, host string) (Snapshot, error) {
+	if m.hasConnectedDependents(ctx, host) {
+		return m.Snapshot(host), &Error{Code: ErrorHostInUse, Message: "SSH 跳板机仍被已连接目标使用", StageHost: host}
+	}
 	m.mu.RLock()
 	s := m.sessions[host]
 	m.mu.RUnlock()
@@ -442,7 +572,7 @@ func (m *Manager) Execute(ctx context.Context, host string, command []string) (C
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	s.mu.Lock()
-	status, controlPath := s.status, s.controlPath
+	status, controlPath, configPath := s.status, s.controlPath, s.configPath
 	s.mu.Unlock()
 	if status != StatusConnected || controlPath == "" {
 		return CommandOutput{}, &Error{Code: ErrorNotConnected, Message: "SSH 服务器尚未连接"}
@@ -451,7 +581,7 @@ func (m *Manager) Execute(ctx context.Context, host string, command []string) (C
 	if !ok {
 		return CommandOutput{}, &Error{Code: ErrorDependency, Message: "SSH 执行器不支持远程命令输出"}
 	}
-	args := []string{"-S", controlPath, "-T", "-o", "BatchMode=yes", "--", host}
+	args := m.withConfig(configPath, "-S", controlPath, "-T", "-o", "BatchMode=yes", "--", host)
 	args = append(args, command...)
 	result, err := runner.Output(ctx, CommandSpec{Binary: "ssh", Args: args})
 	if err == nil {
@@ -485,7 +615,7 @@ func (m *Manager) StartLocalForward(ctx context.Context, host string, localPort,
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	s.mu.Lock()
-	status, controlPath := s.status, s.controlPath
+	status, controlPath, configPath := s.status, s.controlPath, s.configPath
 	s.mu.Unlock()
 	if status != StatusConnected || controlPath == "" {
 		return nil, &Error{Code: ErrorNotConnected, Message: "SSH 服务器尚未连接"}
@@ -494,7 +624,7 @@ func (m *Manager) StartLocalForward(ctx context.Context, host string, localPort,
 	if !ok {
 		return nil, &Error{Code: ErrorDependency, Message: "SSH 执行器不支持主连接检查"}
 	}
-	check := CommandSpec{Binary: "ssh", Args: []string{"-S", controlPath, "-O", "check", host}}
+	check := CommandSpec{Binary: "ssh", Args: m.withConfig(configPath, "-S", controlPath, "-O", "check", host)}
 	if err := runner.Run(ctx, check); err != nil {
 		return nil, controlCheckError(ctx)
 	}
@@ -509,6 +639,7 @@ func (m *Manager) StartLocalForward(ctx context.Context, host string, localPort,
 		"-L", localAddress + ":" + remoteAddress,
 		"--", host,
 	}
+	args = m.withConfig(configPath, args...)
 	process, err := m.runner.Start(ctx, CommandSpec{Binary: "ssh", Args: args})
 	if err != nil {
 		if ctx.Err() != nil {
@@ -570,10 +701,10 @@ func (m *Manager) stopSession(ctx context.Context, s *session) {
 		return
 	}
 	s.status = StatusDisconnecting
-	process, controlPath, runDir, done, helper := s.process, s.controlPath, s.runDir, s.done, s.askpass
+	process, controlPath, configPath, runDir, done, helper := s.process, s.controlPath, s.configPath, s.runDir, s.done, s.askpass
 	s.mu.Unlock()
 	if controlPath != "" {
-		spec := CommandSpec{Binary: "ssh", Args: []string{"-S", controlPath, "-O", "exit", s.host}}
+		spec := CommandSpec{Binary: "ssh", Args: m.withConfig(configPath, "-S", controlPath, "-O", "exit", s.host)}
 		if r, ok := m.runner.(oneShotRunner); ok {
 			_ = r.Run(ctx, spec)
 		}
@@ -594,6 +725,7 @@ func (m *Manager) stopSession(ctx context.Context, s *session) {
 	s.status = StatusDisconnected
 	s.process = nil
 	s.controlPath = ""
+	s.configPath = ""
 	s.runDir = ""
 	s.askpass = nil
 	s.connectedAt = time.Time{}
@@ -608,6 +740,7 @@ func (m *Manager) Close(ctx context.Context) error {
 		hosts = append(hosts, host)
 	}
 	m.mu.RUnlock()
+	hosts = m.closeOrder(ctx, hosts)
 	var first error
 	for _, host := range hosts {
 		if _, err := m.Disconnect(ctx, host); err != nil && first == nil {
@@ -615,6 +748,63 @@ func (m *Manager) Close(ctx context.Context) error {
 		}
 	}
 	return first
+}
+
+func (m *Manager) hasConnectedDependents(ctx context.Context, host string) bool {
+	if m.resolver == nil {
+		return false
+	}
+	m.mu.RLock()
+	list := make([]*session, 0, len(m.sessions))
+	for _, current := range m.sessions {
+		list = append(list, current)
+	}
+	m.mu.RUnlock()
+	for _, current := range list {
+		if current.host == host {
+			continue
+		}
+		jump, err := m.resolver.JumpHost(ctx, current.host)
+		if err != nil || jump != host {
+			continue
+		}
+		current.mu.Lock()
+		status := current.status
+		current.mu.Unlock()
+		if status == StatusConnecting || status == StatusConnected || status == StatusDisconnecting {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) closeOrder(ctx context.Context, hosts []string) []string {
+	if m.resolver == nil {
+		return hosts
+	}
+	depth := make(map[string]int, len(hosts))
+	var visit func(string, map[string]bool) int
+	visit = func(host string, stack map[string]bool) int {
+		if value, ok := depth[host]; ok {
+			return value
+		}
+		if stack[host] {
+			return 0
+		}
+		stack[host] = true
+		value := 0
+		if jump, err := m.resolver.JumpHost(ctx, host); err == nil && jump != "" {
+			value = visit(jump, stack) + 1
+		}
+		delete(stack, host)
+		depth[host] = value
+		return value
+	}
+	for _, host := range hosts {
+		visit(host, make(map[string]bool))
+	}
+	sort.SliceStable(hosts, func(i, j int) bool { return depth[hosts[i]] > depth[hosts[j]] })
+	return hosts
 }
 
 func (m *Manager) monitor(s *session, password, passphrase string) {
@@ -632,7 +822,7 @@ func (m *Manager) monitor(s *session, password, passphrase string) {
 		s.askpass = nil
 		return
 	}
-	diagnostic := sanitizeDiagnostic(process.Diagnostics(), password, passphrase, s.controlPath)
+	diagnostic := sanitizeDiagnostic(process.Diagnostics(), password, passphrase, s.controlPath, s.configPath)
 	if err == nil {
 		s.status = StatusFailed
 		s.diagnostic = diagnostic
@@ -645,6 +835,12 @@ func (m *Manager) monitor(s *session, password, passphrase string) {
 	s.status = StatusFailed
 	s.diagnostic = diagnostic
 	s.lastError = classifyError(diagnostic, "SSH 连接已断开")
+	s.lastError.StageHost = s.host
+	if s.lastError.Code == ErrorHostKeyConfirmation {
+		s.pendingFingerprint = s.lastError.Fingerprint
+	} else {
+		s.pendingFingerprint = ""
+	}
 	if s.lastError.Code == ErrorAuthentication && password == "" && passphrase == "" {
 		s.lastError.Code = ErrorCredentialRequired
 		s.lastError.Message = "SSH 需要密码或私钥口令"
@@ -667,7 +863,10 @@ func (m *Manager) waitForControlMaster(ctx context.Context, s *session, host, co
 	ticker := time.NewTicker(75 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		spec := CommandSpec{Binary: "ssh", Args: []string{"-S", controlPath, "-O", "check", host}}
+		s.mu.Lock()
+		configPath := s.configPath
+		s.mu.Unlock()
+		spec := CommandSpec{Binary: "ssh", Args: m.withConfig(configPath, "-S", controlPath, "-O", "check", host)}
 		if err := runner.Run(readyContext, spec); err == nil {
 			return nil
 		}
@@ -690,6 +889,12 @@ func (m *Manager) waitForControlMaster(ctx context.Context, s *session, host, co
 }
 
 func (m *Manager) fail(s *session, err *Error, diagnostic string) (Snapshot, error) {
+	if err.StageHost == "" {
+		err.StageHost = s.host
+	}
+	if err.Fingerprint == "" {
+		err.Fingerprint = extractFingerprint(diagnostic)
+	}
 	s.mu.Lock()
 	s.status = StatusFailed
 	s.lastError = err
@@ -705,6 +910,41 @@ func (s *session) snapshot() Snapshot {
 		last = &copy
 	}
 	return Snapshot{Host: s.host, Status: s.status, ControlPath: s.controlPath, ConnectedAt: s.connectedAt, LastError: last, Diagnostic: s.diagnostic}
+}
+
+func (m *Manager) withConfig(configPath string, args ...string) []string {
+	if configPath == "" {
+		return args
+	}
+	result := make([]string, 0, len(args)+2)
+	result = append(result, "-F", configPath)
+	result = append(result, args...)
+	return result
+}
+
+func (m *Manager) writeSessionConfig(runDir, jump, jumpControlPath string) (string, error) {
+	if m.config == nil {
+		return "", nil
+	}
+	value, err := m.config.Render()
+	if err != nil {
+		return "", err
+	}
+	if jump != "" && jumpControlPath != "" {
+		if err := validateHost(jump); err != nil {
+			return "", err
+		}
+		override := fmt.Sprintf("Host %s\n    ControlMaster auto\n    ControlPath \"%s\"\n\n", jump, strings.ReplaceAll(strings.ReplaceAll(jumpControlPath, "\\", "\\\\"), "\"", "\\\""))
+		value = append([]byte(override), value...)
+	}
+	path := filepath.Join(runDir, "ssh_config")
+	if err := os.WriteFile(path, value, 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func validateHost(host string) error {
@@ -728,6 +968,10 @@ func classifyError(diagnostic, fallback string) *Error {
 	code := ErrorProcess
 	message := fallback
 	switch {
+	case strings.Contains(lower, "remote host identification has changed"), strings.Contains(lower, "offending"):
+		code, message = ErrorHostKeyChanged, "SSH 主机密钥已变化，已拒绝连接"
+	case strings.Contains(lower, "authenticity of host"), strings.Contains(lower, "are you sure you want to continue connecting"), strings.Contains(lower, "fingerprint"):
+		code, message = ErrorHostKeyConfirmation, "首次连接需要确认 SSH 主机指纹"
 	case strings.Contains(lower, "host key verification failed"), strings.Contains(lower, "remote host identification"):
 		code, message = ErrorHostKey, "主机密钥校验失败，请使用系统 SSH 核验指纹"
 	case strings.Contains(lower, "permission denied"):
@@ -741,7 +985,13 @@ func classifyError(diagnostic, fallback string) *Error {
 	case strings.Contains(lower, "ssh: not found"), strings.Contains(lower, "executable file not found"):
 		code, message = ErrorDependency, "本机缺少 ssh 依赖"
 	}
-	return &Error{Code: code, Message: message, Diagnostic: sanitizeDiagnostic(diagnostic)}
+	return &Error{Code: code, Message: message, Diagnostic: sanitizeDiagnostic(diagnostic), Fingerprint: extractFingerprint(diagnostic)}
+}
+
+var fingerprintPattern = regexp.MustCompile(`SHA256:[A-Za-z0-9+/=]+`)
+
+func extractFingerprint(diagnostic string) string {
+	return fingerprintPattern.FindString(diagnostic)
 }
 
 func sanitizeDiagnostic(value ...string) string {

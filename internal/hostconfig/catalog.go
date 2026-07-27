@@ -154,6 +154,60 @@ func (c *Catalog) ReferencedBy(alias string) []string {
 	return result
 }
 
+// JumpHost returns the direct managed jump alias for alias. System Hosts use
+// their own OpenSSH configuration, so they return an empty jump.
+func (c *Catalog) JumpHost(ctx context.Context, alias string) (string, error) {
+	if err := sshconfig.ValidateAlias(alias); err != nil {
+		return "", err
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, profile := range c.profiles {
+		if profile.Alias == alias {
+			if issue := c.invalidReason[alias]; issue != "" {
+				return "", errors.New(issue)
+			}
+			return profile.JumpHost, nil
+		}
+	}
+	for _, systemHost := range c.system.Hosts {
+		if systemHost.Alias == alias {
+			return "", nil
+		}
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	return "", ErrNotFound
+}
+
+// Username returns the configured username for a managed Host. System Hosts
+// leave this empty so OpenSSH can resolve their effective User option.
+func (c *Catalog) Username(ctx context.Context, alias string) (string, error) {
+	if err := sshconfig.ValidateAlias(alias); err != nil {
+		return "", err
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, profile := range c.profiles {
+		if profile.Alias == alias {
+			if issue := c.invalidReason[alias]; issue != "" {
+				return "", errors.New(issue)
+			}
+			return profile.Username, nil
+		}
+	}
+	for _, systemHost := range c.system.Hosts {
+		if systemHost.Alias == alias {
+			return "", nil
+		}
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	return "", ErrNotFound
+}
+
 // Create validates cross-source constraints and persists a profile.
 func (c *Catalog) Create(ctx context.Context, profile Profile) (Profile, error) {
 	c.mu.Lock()
@@ -221,10 +275,12 @@ func (c *Catalog) Delete(alias string) error {
 func (c *Catalog) Render() ([]byte, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	profiles := c.profiles
 	if c.managedErr != nil {
-		return nil, c.managedErr
+		// A damaged managed file must not disable read-only system Hosts.
+		profiles = nil
 	}
-	return Render(c.profiles, c.systemPath)
+	return Render(profiles, c.systemPath)
 }
 
 func (c *Catalog) validateCandidate(ctx context.Context, profile Profile, updating string) error {

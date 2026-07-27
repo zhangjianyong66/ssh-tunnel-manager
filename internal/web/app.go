@@ -419,11 +419,13 @@ func (a *App) handleServer(w http.ResponseWriter, r *http.Request) {
 }
 
 type connectRequest struct {
-	Username       string `json:"username"`
-	Password       string `json:"password"`
-	Passphrase     string `json:"passphrase"`
-	SavePassword   bool   `json:"savePassword"`
-	SavePassphrase bool   `json:"savePassphrase"`
+	Username           string `json:"username"`
+	Password           string `json:"password"`
+	Passphrase         string `json:"passphrase"`
+	SavePassword       bool   `json:"savePassword"`
+	SavePassphrase     bool   `json:"savePassphrase"`
+	StageHost          string `json:"stageHost"`
+	ConfirmFingerprint string `json:"confirmFingerprint"`
 }
 
 func (a *App) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -432,27 +434,33 @@ func (a *App) handleConnect(w http.ResponseWriter, r *http.Request) {
 	var request connectRequest
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&request); err != nil {
+	if err := decoder.Decode(&request); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		writeError(w, http.StatusBadRequest, "invalid_request", "连接请求格式无效")
 		return
 	}
 	a.hostOps.Lock()
 	defer a.hostOps.Unlock()
+	if issue := a.hostIssue(host); issue != "" {
+		writeError(w, http.StatusConflict, "host_reference_broken", "SSH Host 配置无效: "+issue)
+		return
+	}
 	if !a.hostExists(host) {
 		writeError(w, http.StatusNotFound, "host_not_found", "SSH Host 不存在于当前配置")
 		return
 	}
 	snapshot, err := a.sessions.Connect(r.Context(), host, sshmanager.ConnectOptions{
-		Username:       request.Username,
-		Password:       request.Password,
-		Passphrase:     request.Passphrase,
-		SavePassword:   request.SavePassword,
-		SavePassphrase: request.SavePassphrase,
+		Username:           request.Username,
+		Password:           request.Password,
+		Passphrase:         request.Passphrase,
+		SavePassword:       request.SavePassword,
+		SavePassphrase:     request.SavePassphrase,
+		StageHost:          request.StageHost,
+		ConfirmFingerprint: request.ConfirmFingerprint,
 	})
 	if err != nil {
 		var sshErr *sshmanager.Error
 		if errors.As(err, &sshErr) {
-			writeError(w, statusForSSHError(sshErr.Code), string(sshErr.Code), sshErr.Message)
+			writeSSHError(w, sshErr)
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "connect_failed", "启动 SSH 连接失败")
@@ -464,6 +472,18 @@ func (a *App) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func (a *App) hostIssue(alias string) string {
+	if a.catalog == nil {
+		return ""
+	}
+	for _, host := range a.catalog.Snapshot().Hosts {
+		if host.Alias == alias && !host.Valid {
+			return host.Issue
+		}
+	}
+	return ""
 }
 
 func (a *App) handleDisconnect(w http.ResponseWriter, r *http.Request) {
@@ -478,6 +498,11 @@ func (a *App) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 	_, _ = a.ports.SetAutoRefresh(host, false)
 	snapshot, err := a.sessions.Disconnect(r.Context(), host)
 	if err != nil {
+		var sshErr *sshmanager.Error
+		if errors.As(err, &sshErr) {
+			writeSSHError(w, sshErr)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "disconnect_failed", "停止 SSH 连接失败")
 		return
 	}
@@ -626,8 +651,16 @@ func statusForSSHError(code sshmanager.ErrorCode) int {
 		return http.StatusUnprocessableEntity
 	case sshmanager.ErrorHostKey:
 		return http.StatusConflict
+	case sshmanager.ErrorHostKeyConfirmation, sshmanager.ErrorHostKeyChanged:
+		return http.StatusConflict
 	case sshmanager.ErrorTimeout:
 		return http.StatusGatewayTimeout
+	case sshmanager.ErrorCancelled:
+		return http.StatusRequestTimeout
+	case sshmanager.ErrorNotConnected:
+		return http.StatusConflict
+	case sshmanager.ErrorHostInUse:
+		return http.StatusConflict
 	case sshmanager.ErrorDependency:
 		return http.StatusServiceUnavailable
 	default:
@@ -682,10 +715,23 @@ func writeTunnelError(w http.ResponseWriter, err error) {
 type errorResponse struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	Details any    `json:"details,omitempty"`
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, errorResponse{Code: code, Message: message})
+}
+
+func writeSSHError(w http.ResponseWriter, err *sshmanager.Error) {
+	detailsValue := struct {
+		StageHost   string `json:"stageHost,omitempty"`
+		Fingerprint string `json:"fingerprint,omitempty"`
+	}{StageHost: err.StageHost, Fingerprint: err.Fingerprint}
+	var details any
+	if detailsValue.StageHost != "" || detailsValue.Fingerprint != "" {
+		details = detailsValue
+	}
+	writeJSON(w, statusForSSHError(err.Code), errorResponse{Code: string(err.Code), Message: err.Message, Details: details})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
