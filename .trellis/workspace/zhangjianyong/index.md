@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 8
-- **Last Active**: 2026-07-25
+- **Total Sessions**: 9
+- **Last Active**: 2026-07-27
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~272 | Active |
+| `journal-1.md` | ~306 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 9 | 2026-07-27 | 实现 Host 配置基础里程碑 | `b537ea1`, `c7b6242` | `master` |
 | 8 | 2026-07-25 | 完成SSH隧道管理器MVP整体验收 | `cdce750` | `master` |
 | 7 | 2026-07-25 | 完成M5 Linux发布与交付 | `97434ca` | `master` |
 | 6 | 2026-07-24 | 完成M4可靠性与控制台体验 | `7e35729` | `master` |

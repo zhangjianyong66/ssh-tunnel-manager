@@ -270,3 +270,37 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 9: 实现 Host 配置基础里程碑
+
+**Date**: 2026-07-27
+**Task**: 实现 Host 配置基础里程碑
+**Branch**: `master`
+
+### Summary
+
+完成项目 Host 版本化存储、系统与项目 Catalog、ssh -G 有效配置检查、安全 OpenSSH 渲染和严格 CRUD API；补齐运行状态、隧道、引用与凭据清理门禁，并记录 ProxyJump 不可统一加引号的回归契约。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b537ea1` | (see git log) |
+| `c7b6242` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
