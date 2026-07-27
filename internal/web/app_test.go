@@ -23,6 +23,7 @@ type fakeSessions struct {
 	mu           sync.Mutex
 	states       map[string]sshmanager.Snapshot
 	options      sshmanager.ConnectOptions
+	connectErr   error
 	onDisconnect func(string)
 }
 
@@ -154,6 +155,9 @@ func (f *fakeSessions) Connect(_ context.Context, host string, options sshmanage
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.options = options
+	if f.connectErr != nil {
+		return sshmanager.Snapshot{Host: host, Status: sshmanager.StatusFailed}, f.connectErr
+	}
 	f.states[host] = sshmanager.Snapshot{Host: host, Status: sshmanager.StatusConnected}
 	return f.states[host], nil
 }
@@ -351,6 +355,37 @@ func TestAppHostsAndConnectDoNotEchoSecret(t *testing.T) {
 	}
 	if sessions.options.Password != secret {
 		t.Fatal("connection options did not receive password")
+	}
+}
+
+func TestAppConnectChallengeContainsOnlyStageDetails(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(configPath, []byte("Host server-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sessions := newFakeSessions()
+	sessions.connectErr = &sshmanager.Error{Code: sshmanager.ErrorHostKeyConfirmation, Message: "首次连接需要确认 SSH 主机指纹", StageHost: "jump-a", Fingerprint: "SHA256:abc123"}
+	app, err := NewApp(configPath, sessions, newFakePorts(), newFakeTunnels())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/servers/server-a/connect", strings.NewReader(`{"password":"secret-value","stageHost":"jump-a","confirmFingerprint":"SHA256:abc123"}`))
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("response status = %d %s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, want := range []string{`"code":"host_key_confirmation_required"`, `"stageHost":"jump-a"`, `"fingerprint":"SHA256:abc123"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("response missing %s: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "secret-value") || strings.Contains(body, "diagnostic") {
+		t.Fatalf("challenge response leaked sensitive data: %s", body)
+	}
+	if sessions.options.StageHost != "jump-a" || sessions.options.ConfirmFingerprint != "SHA256:abc123" {
+		t.Fatalf("challenge options = %#v", sessions.options)
 	}
 }
 

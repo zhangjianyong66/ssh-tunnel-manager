@@ -47,3 +47,31 @@ func TestPageTunnelManagementContracts(t *testing.T) {
 		}
 	}
 }
+
+func TestPageManagedHostAndChallengeContracts(t *testing.T) {
+	required := []string{
+		`id="add-host"`,
+		`<th>目标地址</th>`,
+		`<th>跳板</th>`,
+		`id="host-dialog"`,
+		`id="host-alias"`,
+		`id="host-jump"`,
+		`id="host-key-dialog"`,
+		`/api/ssh-hosts`,
+		`method = hostDialog.dataset.alias ? 'PUT' : 'POST'`,
+		`method: 'DELETE'`,
+		`candidate.jumpHost`,
+		`host.valid === false`,
+		`credential_required`,
+		`host_key_confirmation_required`,
+		`stageHost`,
+		`confirmFingerprint`,
+		`指纹变化会被拒绝`,
+		`删除 ' + host.alias + ' 后会同时清理`,
+	}
+	for _, fragment := range required {
+		if !strings.Contains(pageHTML, fragment) {
+			t.Errorf("页面缺少 Host 管理或连接挑战契约 %q", fragment)
+		}
+	}
+}

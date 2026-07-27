@@ -78,3 +78,70 @@ output.WriteByte('\n')
 ```
 
 配置渲染测试必须继续经过真实 `ssh -G`；字符串包含断言只能验证文本形状，不能替代 OpenSSH 语义验证。
+
+## Scenario: M3 Web Host 管理与连接挑战
+
+### 1. Scope / Trigger
+
+- 触发范围：修改 `internal/web/page.go` 的 Host 表格、结构化对话框或连接挑战状态机。
+- 目标：页面只消费 Catalog 和 SSH API 的稳定字段，完成项目 Host CRUD 与跳板/目标分阶段交互。
+
+### 2. Signatures
+
+- 页面读取：`GET /api/ssh-hosts`、`GET /api/servers/{host}`。
+- 页面写入：`POST /api/ssh-hosts`、`PUT /api/ssh-hosts/{alias}`、`DELETE /api/ssh-hosts/{alias}`。
+- 页面连接：`POST /api/servers/{host}/connect`，请求可含 `stageHost`、`confirmFingerprint`、当前阶段凭据。
+
+### 3. Contracts
+
+- Host 表格展示 `source`、`hostName/port`、`jumpHost`、`valid/issue`；系统 Host 不显示编辑和删除入口，项目 Alias 编辑时只读。
+- 跳板选择只允许 `valid=true`、不是当前 Host 且没有 `jumpHost` 的 Catalog 项；服务端仍是最终校验边界。
+- `credential_required` 挑战只打开当前 `details.stageHost` 的凭据对话框；`host_key_confirmation_required` 只展示 `details.stageHost` 与 `details.fingerprint`。
+- 每次重试只提交当前阶段字段；若同一阶段先后出现凭据和指纹挑战，必须保留尚未保存的凭据在内存请求体中，不能写入页面持久化存储。
+- 取消挑战结束当前连接循环并刷新页面，不触发断开已存在的跳板或隧道；`host_key_changed` 和引用失效直接显示服务端稳定错误。
+- 删除确认必须明确说明会清理该 Host 的密码和私钥口令；删除 API 失败时保留页面状态并展示错误。
+
+### 4. Validation & Error Matrix
+
+| 条件 | 页面行为 |
+|---|---|
+| 表单缺少地址、端口、用户名或端口越界 | 浏览器表单阻止提交 |
+| `host_conflict`、`invalid_host_config`、`invalid_jump_host` | 保留服务端中文错误，不重试 |
+| `credential_required` | 按 `stageHost` 询问凭据后重试 |
+| `host_key_confirmation_required` | 显示指纹，确认后以 `confirmFingerprint` 重试 |
+| `host_key_changed`、`host_reference_broken`、`host_in_use` | 直接提示并结束当前操作 |
+
+### 5. Good/Base/Bad Cases
+
+- Good：先为 `mac_home` 保存公网地址，再为 `ssh_ubuntu_home` 选择 `mac_home`，页面分别处理两阶段挑战。
+- Base：只有系统 Host 时仍可连接、探测端口和创建隧道，页面不出现项目写操作。
+- Bad：页面自行判断跳板循环、把秘密放入 `localStorage`、把原始 SSH 诊断插入 DOM，或在页面关闭时调用断开接口。
+
+### 6. Tests Required
+
+- 页面模板契约断言新增/编辑/删除控件、来源/目标/跳板列、单层筛选和 `stageHost`/指纹字段。
+- Web API 测试断言挑战响应只含 `stageHost`/指纹，不含密码、口令或诊断；未知字段和尾随 JSON 仍返回 `400 invalid_request`。
+- 使用 Chrome 桌面与移动视口检查表格横向滚动、对话框按钮和错误文本没有重叠；页面关闭不得产生断开请求。
+- 继续执行 `gofmt -w ./cmd ./internal`、`go test -race ./...`、`go vet ./...`、`go build ./cmd/ssh-tunnel-manager`。
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```javascript
+localStorage.setItem('sshPassword', password);
+payload = { confirmFingerprint: fingerprint };
+```
+
+前者把秘密持久化，后者在凭据后出现指纹挑战时丢失当前阶段凭据。
+
+#### Correct
+
+```javascript
+payload = Object.assign({}, payload, {
+  stageHost: details.stageHost,
+  confirmFingerprint: fingerprint,
+});
+```
+
+秘密只留在当前 Promise 和请求体内存中，并与阶段指纹确认一起提交。

@@ -26,7 +26,7 @@ const pageHTML = `<!doctype html>
     .table-scroll { max-width: 100%; overflow-x: auto; }
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; padding: 11px 8px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }
-    .hosts-table { min-width: 620px; }
+    .hosts-table { min-width: 860px; }
     .tunnel-table { min-width: 760px; }
     .tunnels-section > .table-scroll > .tunnel-table { min-width: 980px; }
     .status, .port-number, .address { font-family: ui-monospace, monospace; }
@@ -55,17 +55,17 @@ const pageHTML = `<!doctype html>
     dialog { border: 1px solid #cbd5e1; border-radius: 8px; padding: 20px; width: min(420px, calc(100vw - 40px)); }
     dialog::backdrop { background: rgb(15 23 42 / 35%); }
     dialog label { display: block; margin: 12px 0; }
-    dialog input[type="text"], dialog input[type="password"] { display: block; width: 100%; margin-top: 5px; padding: 8px; border: 1px solid #cbd5e1; border-radius: 5px; }
+    dialog input[type="text"], dialog input[type="password"], dialog input[type="number"], dialog select { display: block; width: 100%; margin-top: 5px; padding: 8px; border: 1px solid #cbd5e1; border-radius: 5px; background: white; }
+    dialog input[readonly] { background: #f8fafc; color: #475569; }
+    .dialog-note { margin: 0 0 12px; color: #475569; font-size: 14px; }
+    .dialog-error { min-height: 20px; margin: 8px 0 0; color: #b91c1c; font-size: 13px; }
     .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
     @media (max-width: 640px) {
       body { margin-top: 20px; padding: 0 12px; }
       header { align-items: center; }
       .header-actions { padding-top: 0; }
       th, td { padding: 9px 6px; }
-      .hosts-table { min-width: 100%; table-layout: fixed; }
-      .hosts-table > thead th:nth-child(1) { width: 34%; }
-      .hosts-table > thead th:nth-child(3) { width: 34%; }
-      .hosts-table > thead th:nth-child(4) { width: 32%; }
+      .hosts-table { min-width: 720px; }
       .source-column { display: none; }
       .port-row > td { width: 100%; max-width: 0; padding-left: 4px; padding-right: 4px; }
       .port-panel { padding-left: 9px; }
@@ -86,12 +86,13 @@ const pageHTML = `<!doctype html>
   </header>
   <div class="toolbar">
     <button type="button" id="refresh">刷新 Host</button>
+    <button type="button" id="add-host">添加主机</button>
     <span id="message" class="muted" aria-live="polite"></span>
   </div>
   <div class="table-scroll">
     <table class="hosts-table">
-      <thead><tr><th>Host</th><th class="source-column">来源</th><th>状态</th><th>操作</th></tr></thead>
-      <tbody id="hosts"><tr><td colspan="4">加载中...</td></tr></tbody>
+      <thead><tr><th>Host</th><th class="source-column">来源</th><th>目标地址</th><th>跳板</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody id="hosts"><tr><td colspan="6">加载中...</td></tr></tbody>
     </table>
   </div>
   <p id="error" class="error" role="alert"></p>
@@ -114,20 +115,49 @@ const pageHTML = `<!doctype html>
       <div class="dialog-actions"><button value="cancel">取消</button><button value="connect">连接</button></div>
     </form>
   </dialog>
+  <dialog id="host-dialog">
+    <form method="dialog" id="host-form">
+      <h2 id="host-dialog-title">添加 SSH Host</h2>
+      <p class="dialog-note">只保存连接参数，不会读取或上传私钥内容。</p>
+      <label>Host 别名<input id="host-alias" name="alias" type="text" required autocomplete="off"></label>
+      <label>目标地址<input id="host-name" name="hostName" type="text" required autocomplete="off"></label>
+      <label>端口<input id="host-port" name="port" type="number" min="1" max="65535" required inputmode="numeric"></label>
+      <label>用户名<input id="host-username" name="username" type="text" required autocomplete="username"></label>
+      <label>私钥路径（可选）<input id="host-identity" name="identityFile" type="text" autocomplete="off"></label>
+      <label>跳板机（可选）<select id="host-jump" name="jumpHost"><option value="">不使用跳板机</option></select></label>
+      <p id="host-dialog-error" class="dialog-error" role="alert"></p>
+      <div class="dialog-actions"><button value="cancel">取消</button><button id="host-save" value="save">保存</button></div>
+    </form>
+  </dialog>
+  <dialog id="host-key-dialog">
+    <form method="dialog">
+      <h2>确认 SSH 主机指纹</h2>
+      <p id="host-key-stage" class="dialog-note"></p>
+      <p><strong id="host-key-fingerprint" class="status"></strong></p>
+      <p class="dialog-note">只有确认指纹与本次连接提示完全一致时才会继续。指纹变化会被拒绝。</p>
+      <div class="dialog-actions"><button value="cancel">取消</button><button value="confirm">确认并继续</button></div>
+    </form>
+  </dialog>
   <script>
     const hosts = document.getElementById('hosts');
     const tunnels = document.getElementById('tunnels');
     const message = document.getElementById('message');
     const error = document.getElementById('error');
     const credentialDialog = document.getElementById('credential-dialog');
+    const hostDialog = document.getElementById('host-dialog');
+    const hostForm = document.getElementById('host-form');
+    const hostKeyDialog = document.getElementById('host-key-dialog');
     const busyTargets = new Set();
     const expandedLogs = new Set();
     const tunnelLogs = new Map();
     let currentTunnels = [];
     let loading = false;
     let reloadPending = false;
+    let currentHosts = [];
 
-    function requestCredentials() {
+    function requestCredentials(stageHost, username) {
+      document.querySelector('#credential-dialog h2').textContent = 'SSH 凭据：' + stageHost;
+      document.getElementById('credential-username').value = username || '';
       document.getElementById('credential-password').value = '';
       document.getElementById('credential-passphrase').value = '';
       document.getElementById('credential-save').checked = false;
@@ -141,6 +171,80 @@ const pageHTML = `<!doctype html>
         resolve({ username: document.getElementById('credential-username').value, password, passphrase, savePassword: save && !!password, savePassphrase: save && !!passphrase });
       }, { once: true }));
     }
+
+    function requestHostKey(details) {
+      if (!details || !details.stageHost || !details.fingerprint) return Promise.resolve(null);
+      document.getElementById('host-key-stage').textContent = '连接阶段：' + details.stageHost;
+      document.getElementById('host-key-fingerprint').textContent = details.fingerprint;
+      hostKeyDialog.returnValue = 'cancel';
+      hostKeyDialog.showModal();
+      return new Promise(resolve => hostKeyDialog.addEventListener('close', () => {
+        resolve(hostKeyDialog.returnValue === 'confirm' ? details.fingerprint : null);
+      }, { once: true }));
+    }
+
+    function sourceLabel(source) { return source === 'managed' ? '项目' : '系统'; }
+    function hostTarget(host) {
+      if (!host.hostName) return '由系统配置决定';
+      return host.hostName + (host.port ? ':' + host.port : '');
+    }
+
+    function fillJumpOptions(selected, alias) {
+      const select = document.getElementById('host-jump');
+      select.innerHTML = '<option value="">不使用跳板机</option>';
+      for (const candidate of currentHosts) {
+        if (!candidate.valid || candidate.alias === alias || candidate.jumpHost) continue;
+        const option = document.createElement('option');
+        option.value = candidate.alias;
+        option.textContent = candidate.alias + '（' + sourceLabel(candidate.source) + '）';
+        option.selected = candidate.alias === selected;
+        select.appendChild(option);
+      }
+      if (selected && ![...select.options].some(option => option.value === selected)) {
+        const option = document.createElement('option');
+        option.value = selected;
+        option.textContent = selected + '（当前引用无效）';
+        option.selected = true;
+        select.appendChild(option);
+      }
+    }
+
+    function openHostDialog(host) {
+      document.getElementById('host-dialog-title').textContent = host ? '编辑 SSH Host' : '添加 SSH Host';
+      document.getElementById('host-alias').value = host ? host.alias : '';
+      document.getElementById('host-alias').readOnly = !!host;
+      document.getElementById('host-name').value = host ? host.hostName : '';
+      document.getElementById('host-port').value = host ? host.port : 22;
+      document.getElementById('host-username').value = host ? host.username : '';
+      document.getElementById('host-identity').value = host ? host.identityFile : '';
+      document.getElementById('host-dialog-error').textContent = '';
+      fillJumpOptions(host ? host.jumpHost : '', host ? host.alias : '');
+      hostDialog.returnValue = 'cancel';
+      hostDialog.dataset.alias = host ? host.alias : '';
+      hostDialog.showModal();
+    }
+
+    hostForm.addEventListener('submit', event => {
+      if (!hostForm.reportValidity()) event.preventDefault();
+    });
+
+    hostDialog.addEventListener('close', async () => {
+      if (hostDialog.returnValue !== 'save' || !hostForm.checkValidity()) return;
+      const alias = document.getElementById('host-alias').value.trim();
+      const body = { hostName: document.getElementById('host-name').value.trim(), port: Number(document.getElementById('host-port').value), username: document.getElementById('host-username').value.trim(), identityFile: document.getElementById('host-identity').value.trim(), jumpHost: document.getElementById('host-jump').value };
+      if (!hostDialog.dataset.alias) body.alias = alias;
+      const method = hostDialog.dataset.alias ? 'PUT' : 'POST';
+      const path = '/api/ssh-hosts' + (hostDialog.dataset.alias ? '/' + encodeURIComponent(hostDialog.dataset.alias) : '');
+      try {
+        const response = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const result = await responseJSON(response);
+        if (!response.ok) throw result;
+        announce(hostDialog.dataset.alias ? '已更新 Host' : '已添加 Host');
+        await load();
+      } catch (value) { showError(value); }
+    });
+
+    document.getElementById('add-host').onclick = () => openHostDialog(null);
 
     function showError(value) {
       error.textContent = value && value.message ? value.message : '操作失败';
@@ -528,6 +632,125 @@ const pageHTML = `<!doctype html>
       return panel;
     }
 
+    async function connectHost(host, action) {
+      action.disabled = true;
+      error.textContent = '';
+      let payload = {};
+      try {
+        while (true) {
+          const operation = await fetch('/api/servers/' + encodeURIComponent(host.alias) + '/connect', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+          });
+          const result = await responseJSON(operation);
+          if (operation.ok) {
+            const discovery = await fetch('/api/servers/' + encodeURIComponent(host.alias) + '/ports/refresh', { method: 'POST' });
+            if (!discovery.ok) showError(await responseJSON(discovery));
+            announce('已连接 ' + host.alias);
+            break;
+          }
+          if (result.code === 'credential_required') {
+            const details = result.details || {};
+            const credentials = await requestCredentials(details.stageHost || host.alias, details.username || host.username);
+            if (!credentials) return;
+            payload = Object.assign(credentials, { stageHost: details.stageHost || host.alias });
+            continue;
+          }
+          if (result.code === 'host_key_confirmation_required') {
+            const fingerprint = await requestHostKey(result.details);
+            if (!fingerprint) return;
+            payload = Object.assign({}, payload, { stageHost: result.details.stageHost, confirmFingerprint: fingerprint });
+            continue;
+          }
+          showError(result);
+          break;
+        }
+      } catch (value) { showError(value); }
+      finally { action.disabled = false; await load(); }
+    }
+
+    async function editHost(host) { openHostDialog(host); }
+
+    async function deleteHost(host) {
+      if (!window.confirm('删除 ' + host.alias + ' 后会同时清理该 Host 的系统密钥环凭据，是否继续？')) return;
+      try {
+        const response = await fetch('/api/ssh-hosts/' + encodeURIComponent(host.alias), { method: 'DELETE' });
+        const result = await responseJSON(response);
+        if (!response.ok) throw result;
+        announce('已删除 ' + host.alias);
+        await load();
+      } catch (value) { showError(value); }
+    }
+
+    async function renderHost(host, tunnelByTarget) {
+      const row = document.createElement('tr');
+      const alias = document.createElement('td');
+      alias.textContent = host.alias;
+      const source = document.createElement('td');
+      source.className = 'source-column';
+      source.textContent = sourceLabel(host.source);
+      const target = document.createElement('td');
+      target.className = 'address';
+      target.textContent = hostTarget(host);
+      const jump = document.createElement('td');
+      jump.textContent = host.jumpHost || '—';
+      const status = document.createElement('td');
+      status.className = 'status';
+      status.textContent = host.valid === false ? '配置无效' : '加载中...';
+      const actions = document.createElement('td');
+      actions.className = 'actions';
+      row.append(alias, source, target, jump, status, actions);
+      if (host.valid === false) {
+        const issue = document.createElement('span');
+        issue.className = 'inline-error';
+        issue.textContent = host.issue || '配置引用失效';
+        status.appendChild(issue);
+      }
+      if (host.editable) {
+        actions.appendChild(actionButton('编辑', 'edit:' + host.alias, () => editHost(host)));
+        actions.appendChild(actionButton('删除', 'delete:' + host.alias, () => deleteHost(host), 'danger'));
+      }
+      const action = actionButton('连接', 'connect:' + host.alias, () => connectHost(host, action));
+      actions.appendChild(action);
+      if (host.valid === false) {
+        action.disabled = true;
+        hosts.appendChild(row);
+        return;
+      }
+      const stateResponse = await fetch('/api/servers/' + encodeURIComponent(host.alias));
+      const state = await responseJSON(stateResponse);
+      if (!stateResponse.ok) throw state;
+      status.textContent = host.valid === false ? '配置无效' : ({ connected: '已连接', connecting: '连接中', disconnecting: '断开中', failed: '连接失败' }[state.status] || '未连接');
+      if (host.valid !== false) {
+        action.textContent = state.status === 'connected' ? '断开' : '连接';
+        action.dataset.idleLabel = action.textContent;
+        action.onclick = async () => {
+          if (state.status !== 'connected') return connectHost(host, action);
+          action.disabled = true;
+          try {
+            const response = await fetch('/api/servers/' + encodeURIComponent(host.alias) + '/disconnect', { method: 'POST' });
+            const result = await responseJSON(response);
+            if (!response.ok) throw result;
+            announce('已断开 ' + host.alias);
+          } catch (value) { showError(value); }
+          finally { action.disabled = false; await load(); }
+        };
+      }
+      hosts.appendChild(row);
+      if (state.status === 'connected') {
+        const portResponse = await fetch('/api/servers/' + encodeURIComponent(host.alias) + '/ports');
+        const portState = await responseJSON(portResponse);
+        if (portResponse.ok) {
+          const portRow = document.createElement('tr');
+          portRow.className = 'port-row';
+          const cell = document.createElement('td');
+          cell.colSpan = 6;
+          cell.appendChild(portPanel(host.alias, portState, tunnelByTarget));
+          portRow.appendChild(cell);
+          hosts.appendChild(portRow);
+        }
+      }
+    }
+
     async function loadOnce() {
       const [hostsResponse, tunnelResponse] = await Promise.all([
         fetch('/api/ssh-hosts'),
@@ -550,67 +773,10 @@ const pageHTML = `<!doctype html>
       await Promise.all([...expandedLogs].map(id => loadTunnelLogs(id)));
       const tunnelByTarget = new Map(tunnelItems.map(item => [tunnelKey(item.host, item.remotePort), item]));
       renderTunnels(tunnelItems);
+      currentHosts = hostData.hosts || [];
       hosts.innerHTML = '';
-      for (const host of hostData.hosts || []) {
-        const row = document.createElement('tr');
-        row.innerHTML = '<td></td><td class="source-column"></td><td class="status">加载中...</td><td></td>';
-        row.children[0].textContent = host.alias;
-        row.children[1].textContent = host.source;
-        const action = document.createElement('button');
-        action.type = 'button';
-        action.textContent = '连接';
-        row.children[3].appendChild(action);
-        const stateResponse = await fetch('/api/servers/' + encodeURIComponent(host.alias));
-        const state = await responseJSON(stateResponse);
-        if (!stateResponse.ok) throw state;
-        row.children[2].textContent = state.status;
-        action.textContent = state.status === 'connected' ? '断开' : '连接';
-        action.onclick = async () => {
-          error.textContent = '';
-          action.disabled = true;
-          const endpoint = state.status === 'connected' ? 'disconnect' : 'connect';
-          try {
-            let operation = await fetch('/api/servers/' + encodeURIComponent(host.alias) + '/' + endpoint, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: endpoint === 'connect' ? '{}' : undefined
-            });
-            let result = await responseJSON(operation);
-            if (endpoint === 'connect' && !operation.ok && result.code === 'credential_required') {
-              const credentials = await requestCredentials();
-              if (!credentials) { action.disabled = false; return; }
-              operation = await fetch('/api/servers/' + encodeURIComponent(host.alias) + '/connect', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(credentials)
-              });
-              result = await responseJSON(operation);
-            }
-            if (!operation.ok) {
-              showError(result);
-            } else if (endpoint === 'connect') {
-              const discovery = await fetch('/api/servers/' + encodeURIComponent(host.alias) + '/ports/refresh', { method: 'POST' });
-              if (!discovery.ok) showError(await responseJSON(discovery));
-            }
-          } catch (value) {
-            showError(value);
-          }
-          await load();
-        };
-        hosts.appendChild(row);
-        if (state.status === 'connected') {
-          const portResponse = await fetch('/api/servers/' + encodeURIComponent(host.alias) + '/ports');
-          const portState = await responseJSON(portResponse);
-          if (portResponse.ok) {
-            const portRow = document.createElement('tr');
-            portRow.className = 'port-row';
-            const cell = document.createElement('td');
-            cell.colSpan = 4;
-            cell.appendChild(portPanel(host.alias, portState, tunnelByTarget));
-            portRow.appendChild(cell);
-            hosts.appendChild(portRow);
-          }
-        }
-      }
-      if (!hostData.hosts || hostData.hosts.length === 0) hosts.innerHTML = '<tr><td colspan="4">未找到显式 SSH Host</td></tr>';
+      for (const host of currentHosts) await renderHost(host, tunnelByTarget);
+      if (currentHosts.length === 0) hosts.innerHTML = '<tr><td colspan="6">未找到显式 SSH Host</td></tr>';
       announce('已刷新');
     }
 
