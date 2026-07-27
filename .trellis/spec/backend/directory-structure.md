@@ -5,7 +5,9 @@
 ## 当前布局
 
     cmd/ssh-tunnel-manager/main.go  可执行程序入口、HTTP 路由和 MVP 页面
+    internal/configfile/            XDG 私有权限原子配置写入
     internal/credential/            Secret Service 凭据接口和 D-Bus 适配器
+    internal/hostconfig/            项目 Host 存储、合并 Catalog 和 OpenSSH 配置渲染
     internal/portdiscovery/         ss 输出解析、端口快照和自动刷新生命周期
     internal/preference/            XDG 非敏感自动刷新偏好
     internal/ssh/                   OpenSSH ControlMaster、askpass 和连接状态
@@ -27,6 +29,7 @@
 - 安装模板放在 packaging/；本地和 CI 共用的发布/交付检查放在 scripts/，不得在工作流中复制第二套打包逻辑。
 - 测试文件与被测 Go 包放在同一目录，使用 <name>_test.go。
 - 非敏感偏好使用 `internal/preference` 的版本化 JSON 文件；不创建数据库目录、迁移目录或 ORM 层，除非未来需求明确引入其他持久化实现。
+- 项目管理的非敏感 SSH Host 使用 `internal/hostconfig` 的版本化 JSON；`internal/configfile` 只提供共享原子写入，不拥有业务 schema 或校验规则。
 
 ## 命名与边界
 

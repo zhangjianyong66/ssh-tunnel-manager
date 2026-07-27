@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/credential"
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/hostconfig"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/portdiscovery"
 	sshmanager "github.com/zhangjianyong66/ssh-tunnel-manager/internal/ssh"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/tunnel"
@@ -180,6 +182,122 @@ type fakePreferences struct {
 	values  map[string]bool
 	setErr  error
 	readErr error
+}
+
+type fakeHostCatalog struct {
+	mu         sync.Mutex
+	snapshot   hostconfig.Snapshot
+	profiles   map[string]hostconfig.Profile
+	references map[string][]string
+	refreshErr error
+	createErr  error
+	updateErr  error
+	deleteErr  error
+	deleted    []string
+}
+
+func newFakeHostCatalog(profiles ...hostconfig.Profile) *fakeHostCatalog {
+	result := &fakeHostCatalog{profiles: make(map[string]hostconfig.Profile), references: make(map[string][]string)}
+	result.snapshot.Hosts = []hostconfig.Host{{Alias: "system-host", Source: hostconfig.SourceSystem, Valid: true}}
+	for _, profile := range profiles {
+		result.profiles[profile.Alias] = profile
+		result.snapshot.Hosts = append(result.snapshot.Hosts, managedHostResponse(profile))
+		if profile.JumpHost != "" {
+			result.references[profile.JumpHost] = append(result.references[profile.JumpHost], profile.Alias)
+		}
+	}
+	return result
+}
+
+func (f *fakeHostCatalog) Refresh(context.Context) error { return f.refreshErr }
+
+func (f *fakeHostCatalog) Snapshot() hostconfig.Snapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	result := f.snapshot
+	result.Hosts = append([]hostconfig.Host(nil), result.Hosts...)
+	return result
+}
+
+func (f *fakeHostCatalog) Has(alias string) bool {
+	for _, host := range f.Snapshot().Hosts {
+		if host.Alias == alias && host.Valid {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeHostCatalog) Managed(alias string) (hostconfig.Profile, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	profile, ok := f.profiles[alias]
+	return profile, ok
+}
+
+func (f *fakeHostCatalog) ReferencedBy(alias string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.references[alias]...)
+}
+
+func (f *fakeHostCatalog) Create(_ context.Context, profile hostconfig.Profile) (hostconfig.Profile, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.createErr != nil {
+		return hostconfig.Profile{}, f.createErr
+	}
+	f.profiles[profile.Alias] = profile
+	f.snapshot.Hosts = append(f.snapshot.Hosts, managedHostResponse(profile))
+	return profile, nil
+}
+
+func (f *fakeHostCatalog) Update(_ context.Context, alias string, profile hostconfig.Profile) (hostconfig.Profile, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.updateErr != nil {
+		return hostconfig.Profile{}, f.updateErr
+	}
+	f.profiles[alias] = profile
+	for index, host := range f.snapshot.Hosts {
+		if host.Alias == alias && host.Source == hostconfig.SourceManaged {
+			f.snapshot.Hosts[index] = managedHostResponse(profile)
+		}
+	}
+	return profile, nil
+}
+
+func (f *fakeHostCatalog) Delete(alias string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	delete(f.profiles, alias)
+	f.deleted = append(f.deleted, alias)
+	for index, host := range f.snapshot.Hosts {
+		if host.Alias == alias && host.Source == hostconfig.SourceManaged {
+			f.snapshot.Hosts = append(f.snapshot.Hosts[:index], f.snapshot.Hosts[index+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+type fakeCredentialCleaner struct {
+	mu          sync.Mutex
+	refs        []credential.Ref
+	failPurpose string
+}
+
+func (f *fakeCredentialCleaner) Delete(_ context.Context, ref credential.Ref) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refs = append(f.refs, ref)
+	if ref.Purpose == f.failPurpose {
+		return credential.ErrUnavailable
+	}
+	return nil
 }
 
 func newFakePreferences() *fakePreferences {
@@ -633,5 +751,170 @@ func TestAppDisconnectCleansHostInOrder(t *testing.T) {
 	}
 	if got := strings.Join(order, ","); got != "tunnels,discovery,ssh" {
 		t.Fatalf("cleanup order = %s", got)
+	}
+}
+
+func TestManagedHostCatalogListAndCRUD(t *testing.T) {
+	profile := hostconfig.Profile{Alias: "managed", HostName: "managed.example", Port: 22, Username: "alice"}
+	catalog := newFakeHostCatalog(profile)
+	cleaner := &fakeCredentialCleaner{}
+	app, err := NewAppWithCatalog(catalog, cleaner, newFakeSessions(), newFakePorts(), newFakeTunnels())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	list := httptest.NewRecorder()
+	app.Handler().ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/ssh-hosts", nil))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"source":"system"`) || !strings.Contains(list.Body.String(), `"source":"managed"`) {
+		t.Fatalf("list = %d %s", list.Code, list.Body.String())
+	}
+
+	create := httptest.NewRecorder()
+	createBody := `{"alias":"target","hostName":"192.0.2.210","port":22,"username":"ubuntu","identityFile":"","jumpHost":"managed"}`
+	app.Handler().ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/api/ssh-hosts", strings.NewReader(createBody)))
+	if create.Code != http.StatusCreated || !strings.Contains(create.Body.String(), `"alias":"target"`) {
+		t.Fatalf("create = %d %s", create.Code, create.Body.String())
+	}
+
+	update := httptest.NewRecorder()
+	updateBody := `{"hostName":"managed.example","port":2222,"username":"bob","identityFile":"","jumpHost":""}`
+	app.Handler().ServeHTTP(update, httptest.NewRequest(http.MethodPut, "/api/ssh-hosts/managed", strings.NewReader(updateBody)))
+	if update.Code != http.StatusOK || !strings.Contains(update.Body.String(), `"username":"bob"`) {
+		t.Fatalf("update = %d %s", update.Code, update.Body.String())
+	}
+	if len(cleaner.refs) != 2 || cleaner.refs[0].Username != "alice" || cleaner.refs[1].Username != "alice" {
+		t.Fatalf("username cleanup refs = %#v", cleaner.refs)
+	}
+
+	deleteResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(deleteResponse, httptest.NewRequest(http.MethodDelete, "/api/ssh-hosts/managed", nil))
+	if deleteResponse.Code != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", deleteResponse.Code, deleteResponse.Body.String())
+	}
+	if len(cleaner.refs) != 4 || cleaner.refs[2].Username != "bob" || cleaner.refs[3].Username != "bob" {
+		t.Fatalf("delete cleanup refs = %#v", cleaner.refs)
+	}
+	if len(catalog.deleted) != 1 || catalog.deleted[0] != "managed" {
+		t.Fatalf("deleted = %#v", catalog.deleted)
+	}
+}
+
+func TestManagedHostRequestsAreStrictAndMapConfigErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		createErr  error
+		wantStatus int
+		wantCode   string
+	}{
+		{"unknown field", `{"alias":"target","hostName":"example.com","port":22,"username":"alice","unknown":true}`, nil, http.StatusBadRequest, "invalid_request"},
+		{"missing port", `{"alias":"target","hostName":"example.com","username":"alice"}`, nil, http.StatusBadRequest, "invalid_host_config"},
+		{"trailing value", `{"alias":"target","hostName":"example.com","port":22,"username":"alice"}{}`, nil, http.StatusBadRequest, "invalid_request"},
+		{"alias conflict", `{"alias":"target","hostName":"example.com","port":22,"username":"alice"}`, hostconfig.ErrConflict, http.StatusConflict, "host_conflict"},
+		{"invalid jump", `{"alias":"target","hostName":"example.com","port":22,"username":"alice","jumpHost":"missing"}`, hostconfig.ErrInvalidJump, http.StatusBadRequest, "invalid_jump_host"},
+		{"store unavailable", `{"alias":"target","hostName":"example.com","port":22,"username":"alice"}`, hostconfig.ErrUnavailable, http.StatusServiceUnavailable, "managed_config_unavailable"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			catalog := newFakeHostCatalog()
+			catalog.createErr = test.createErr
+			app, err := NewAppWithCatalog(catalog, &fakeCredentialCleaner{}, newFakeSessions(), newFakePorts(), newFakeTunnels())
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/ssh-hosts", strings.NewReader(test.body)))
+			if response.Code != test.wantStatus || !strings.Contains(response.Body.String(), `"code":"`+test.wantCode+`"`) {
+				t.Fatalf("response = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestManagedHostMutationRejectsActiveAndReferencedHosts(t *testing.T) {
+	profile := hostconfig.Profile{Alias: "jump", HostName: "jump.example", Port: 22, Username: "alice"}
+	tests := []struct {
+		name     string
+		prepare  func(*fakeHostCatalog, *fakeSessions, *fakeTunnels)
+		wantText string
+	}{
+		{"connected", func(_ *fakeHostCatalog, sessions *fakeSessions, _ *fakeTunnels) {
+			sessions.states["jump"] = sshmanager.Snapshot{Host: "jump", Status: sshmanager.StatusConnected}
+		}, "正在使用"},
+		{"running tunnel", func(_ *fakeHostCatalog, _ *fakeSessions, tunnels *fakeTunnels) {
+			tunnels.snapshots = []tunnel.Snapshot{{ID: "t", Host: "jump", Status: tunnel.StatusWaitingReconnect}}
+		}, "隧道"},
+		{"referenced", func(catalog *fakeHostCatalog, _ *fakeSessions, _ *fakeTunnels) {
+			catalog.references["jump"] = []string{"target"}
+		}, "跳板机"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			catalog := newFakeHostCatalog(profile)
+			sessions := newFakeSessions()
+			tunnels := newFakeTunnels()
+			test.prepare(catalog, sessions, tunnels)
+			cleaner := &fakeCredentialCleaner{}
+			app, err := NewAppWithCatalog(catalog, cleaner, sessions, newFakePorts(), tunnels)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/ssh-hosts/jump", nil))
+			if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), test.wantText) || len(cleaner.refs) != 0 || len(catalog.deleted) != 0 {
+				t.Fatalf("response = %d %s, refs=%#v deleted=%#v", response.Code, response.Body.String(), cleaner.refs, catalog.deleted)
+			}
+		})
+	}
+}
+
+func TestManagedHostCredentialCleanupFailurePreservesProfile(t *testing.T) {
+	profile := hostconfig.Profile{Alias: "managed", HostName: "managed.example", Port: 22, Username: "alice"}
+	catalog := newFakeHostCatalog(profile)
+	cleaner := &fakeCredentialCleaner{failPurpose: "passphrase"}
+	app, err := NewAppWithCatalog(catalog, cleaner, newFakeSessions(), newFakePorts(), newFakeTunnels())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/api/ssh-hosts/managed", nil))
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"code":"credential_cleanup_failed"`) {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+	if len(cleaner.refs) != 2 || len(catalog.deleted) != 0 {
+		t.Fatalf("refs=%#v deleted=%#v", cleaner.refs, catalog.deleted)
+	}
+}
+
+func TestManagedHostRefreshUsesCatalog(t *testing.T) {
+	catalog := newFakeHostCatalog()
+	catalog.refreshErr = errors.New("refresh failed")
+	app, err := NewAppWithCatalog(catalog, &fakeCredentialCleaner{}, newFakeSessions(), newFakePorts(), newFakeTunnels())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/ssh-hosts/refresh", nil))
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), `"code":"config_read_failed"`) {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestManagedHostRejectsSystemWritesAndMissingCredentialCleaner(t *testing.T) {
+	catalog := newFakeHostCatalog()
+	if _, err := NewAppWithCatalog(catalog, nil, newFakeSessions(), newFakePorts(), newFakeTunnels()); err == nil {
+		t.Fatal("expected missing credential cleaner error")
+	}
+	app, err := NewAppWithCatalog(catalog, &fakeCredentialCleaner{}, newFakeSessions(), newFakePorts(), newFakeTunnels())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, method := range []string{http.MethodPut, http.MethodDelete} {
+		response := httptest.NewRecorder()
+		body := strings.NewReader(`{"hostName":"example.com","port":22,"username":"alice"}`)
+		app.Handler().ServeHTTP(response, httptest.NewRequest(method, "/api/ssh-hosts/system-host", body))
+		if response.Code != http.StatusMethodNotAllowed || !strings.Contains(response.Body.String(), `"code":"system_host_read_only"`) {
+			t.Fatalf("%s response = %d %s", method, response.Code, response.Body.String())
+		}
 	}
 }

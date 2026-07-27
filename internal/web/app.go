@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/credential"
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/hostconfig"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/portdiscovery"
 	sshmanager "github.com/zhangjianyong66/ssh-tunnel-manager/internal/ssh"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/sshconfig"
@@ -46,12 +48,30 @@ type preferenceStore interface {
 	SetAutoRefresh(string, bool) error
 }
 
+type hostCatalog interface {
+	Refresh(context.Context) error
+	Snapshot() hostconfig.Snapshot
+	Has(string) bool
+	Managed(string) (hostconfig.Profile, bool)
+	ReferencedBy(string) []string
+	Create(context.Context, hostconfig.Profile) (hostconfig.Profile, error)
+	Update(context.Context, string, hostconfig.Profile) (hostconfig.Profile, error)
+	Delete(string) error
+}
+
+type credentialCleaner interface {
+	Delete(context.Context, credential.Ref) error
+}
+
 // App owns the SSH configuration snapshot and control-page HTTP handlers.
 type App struct {
 	mu          sync.RWMutex
+	hostOps     sync.Mutex
 	config      sshconfig.Config
 	configPath  string
 	loader      configLoader
+	catalog     hostCatalog
+	credentials credentialCleaner
 	sessions    sessionManager
 	ports       portDiscovery
 	tunnels     tunnelService
@@ -62,6 +82,23 @@ type App struct {
 // NewApp loads the initial SSH config and creates the control-page handler.
 func NewApp(configPath string, sessions sessionManager, ports portDiscovery, tunnels tunnelService, preferences ...preferenceStore) (*App, error) {
 	return newApp(configPath, sshconfig.Loader{}, sessions, ports, tunnels, preferences...)
+}
+
+// NewAppWithCatalog creates the production app with managed Host CRUD.
+func NewAppWithCatalog(catalog hostCatalog, credentials credentialCleaner, sessions sessionManager, ports portDiscovery, tunnels tunnelService, preferences ...preferenceStore) (*App, error) {
+	if catalog == nil {
+		return nil, errors.New("SSH Host Catalog 不能为空")
+	}
+	if credentials == nil {
+		return nil, errors.New("SSH Host 凭据清理器不能为空")
+	}
+	app, err := newApp("", nil, sessions, ports, tunnels, preferences...)
+	if err != nil {
+		return nil, err
+	}
+	app.catalog = catalog
+	app.credentials = credentials
+	return app, nil
 }
 
 func newApp(configPath string, loader configLoader, sessions sessionManager, ports portDiscovery, tunnels tunnelService, preferences ...preferenceStore) (*App, error) {
@@ -78,13 +115,18 @@ func newApp(configPath string, loader configLoader, sessions sessionManager, por
 	if len(preferences) > 0 {
 		app.preferences = preferences[0]
 	}
-	if err := app.refresh(); err != nil {
-		return nil, err
+	if loader != nil {
+		if err := app.refresh(); err != nil {
+			return nil, err
+		}
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", app.handlePage)
 	mux.HandleFunc("GET /api/ssh-hosts", app.handleHosts)
+	mux.HandleFunc("POST /api/ssh-hosts", app.handleCreateHost)
 	mux.HandleFunc("POST /api/ssh-hosts/refresh", app.handleRefresh)
+	mux.HandleFunc("PUT /api/ssh-hosts/{host}", app.handleUpdateHost)
+	mux.HandleFunc("DELETE /api/ssh-hosts/{host}", app.handleDeleteHost)
 	mux.HandleFunc("GET /api/servers/{host}", app.handleServer)
 	mux.HandleFunc("POST /api/servers/{host}/connect", app.handleConnect)
 	mux.HandleFunc("POST /api/servers/{host}/disconnect", app.handleDisconnect)
@@ -103,6 +145,9 @@ func newApp(configPath string, loader configLoader, sessions sessionManager, por
 func (a *App) Handler() http.Handler { return a.handler }
 
 func (a *App) refresh() error {
+	if a.catalog != nil {
+		return a.catalog.Refresh(context.Background())
+	}
 	config, err := a.loader.Load(a.configPath)
 	if err != nil {
 		return err
@@ -114,6 +159,9 @@ func (a *App) refresh() error {
 }
 
 func (a *App) hostExists(host string) bool {
+	if a.catalog != nil {
+		return a.catalog.Has(host)
+	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	for _, candidate := range a.config.Hosts {
@@ -132,6 +180,10 @@ func (a *App) handlePage(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *App) handleHosts(w http.ResponseWriter, _ *http.Request) {
+	if a.catalog != nil {
+		writeJSON(w, http.StatusOK, a.catalog.Snapshot())
+		return
+	}
 	a.mu.RLock()
 	config := a.config
 	config.Hosts = append([]sshconfig.Host(nil), config.Hosts...)
@@ -140,12 +192,221 @@ func (a *App) handleHosts(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, config)
 }
 
-func (a *App) handleRefresh(w http.ResponseWriter, _ *http.Request) {
-	if err := a.refresh(); err != nil {
+func (a *App) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	var err error
+	if a.catalog != nil {
+		err = a.catalog.Refresh(r.Context())
+	} else {
+		err = a.refresh()
+	}
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "config_read_failed", "读取 SSH 配置失败")
 		return
 	}
 	a.handleHosts(w, nil)
+}
+
+type createHostRequest struct {
+	Alias        string `json:"alias"`
+	HostName     string `json:"hostName"`
+	Port         *int   `json:"port"`
+	Username     string `json:"username"`
+	IdentityFile string `json:"identityFile"`
+	JumpHost     string `json:"jumpHost"`
+}
+
+type updateHostRequest struct {
+	HostName     string `json:"hostName"`
+	Port         *int   `json:"port"`
+	Username     string `json:"username"`
+	IdentityFile string `json:"identityFile"`
+	JumpHost     string `json:"jumpHost"`
+}
+
+func (a *App) handleCreateHost(w http.ResponseWriter, r *http.Request) {
+	if a.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "managed_config_unavailable", "项目 SSH Host 配置不可用")
+		return
+	}
+	var request createHostRequest
+	if !decodeHostRequest(w, r, &request) {
+		return
+	}
+	profile, ok := request.profile(w)
+	if !ok {
+		return
+	}
+	a.hostOps.Lock()
+	created, err := a.catalog.Create(r.Context(), profile)
+	a.hostOps.Unlock()
+	if err != nil {
+		writeHostConfigError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, managedHostResponse(created))
+}
+
+func (a *App) handleUpdateHost(w http.ResponseWriter, r *http.Request) {
+	if a.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "managed_config_unavailable", "项目 SSH Host 配置不可用")
+		return
+	}
+	alias := r.PathValue("host")
+	var request updateHostRequest
+	if !decodeHostRequest(w, r, &request) {
+		return
+	}
+	profile, ok := request.profile(alias, w)
+	if !ok {
+		return
+	}
+	a.hostOps.Lock()
+	defer a.hostOps.Unlock()
+	current, exists := a.catalog.Managed(alias)
+	if !exists {
+		if a.catalog.Has(alias) {
+			writeError(w, http.StatusMethodNotAllowed, "system_host_read_only", "系统 SSH Host 只能读取")
+			return
+		}
+		writeError(w, http.StatusNotFound, "managed_host_not_found", "项目 SSH Host 不存在")
+		return
+	}
+	if reason := a.hostMutationBlock(alias); reason != "" {
+		writeError(w, http.StatusConflict, "host_in_use", reason)
+		return
+	}
+	if current.Username != profile.Username {
+		if err := a.clearCredentials(r.Context(), current); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "credential_cleanup_failed", "清理旧用户名凭据失败，Host 未修改")
+			return
+		}
+	}
+	updated, err := a.catalog.Update(r.Context(), alias, profile)
+	if err != nil {
+		writeHostConfigError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, managedHostResponse(updated))
+}
+
+func (a *App) handleDeleteHost(w http.ResponseWriter, r *http.Request) {
+	if a.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "managed_config_unavailable", "项目 SSH Host 配置不可用")
+		return
+	}
+	alias := r.PathValue("host")
+	a.hostOps.Lock()
+	defer a.hostOps.Unlock()
+	profile, exists := a.catalog.Managed(alias)
+	if !exists {
+		if a.catalog.Has(alias) {
+			writeError(w, http.StatusMethodNotAllowed, "system_host_read_only", "系统 SSH Host 只能读取")
+			return
+		}
+		writeError(w, http.StatusNotFound, "managed_host_not_found", "项目 SSH Host 不存在")
+		return
+	}
+	if reason := a.hostMutationBlock(alias); reason != "" {
+		writeError(w, http.StatusConflict, "host_in_use", reason)
+		return
+	}
+	if err := a.clearCredentials(r.Context(), profile); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "credential_cleanup_failed", "清理 Host 凭据失败，Host 未删除")
+		return
+	}
+	if err := a.catalog.Delete(alias); err != nil {
+		writeHostConfigError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func decodeHostRequest(w http.ResponseWriter, r *http.Request, value any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid_request", "SSH Host 请求格式无效")
+		return false
+	}
+	return true
+}
+
+func (r createHostRequest) profile(w http.ResponseWriter) (hostconfig.Profile, bool) {
+	if r.Port == nil || *r.Port < 1 || *r.Port > 65535 {
+		writeError(w, http.StatusBadRequest, "invalid_host_config", "SSH Host 端口无效")
+		return hostconfig.Profile{}, false
+	}
+	return hostconfig.Profile{Alias: r.Alias, HostName: r.HostName, Port: uint16(*r.Port), Username: r.Username, IdentityFile: r.IdentityFile, JumpHost: r.JumpHost}, true
+}
+
+func (r updateHostRequest) profile(alias string, w http.ResponseWriter) (hostconfig.Profile, bool) {
+	if r.Port == nil || *r.Port < 1 || *r.Port > 65535 {
+		writeError(w, http.StatusBadRequest, "invalid_host_config", "SSH Host 端口无效")
+		return hostconfig.Profile{}, false
+	}
+	return hostconfig.Profile{Alias: alias, HostName: r.HostName, Port: uint16(*r.Port), Username: r.Username, IdentityFile: r.IdentityFile, JumpHost: r.JumpHost}, true
+}
+
+func managedHostResponse(profile hostconfig.Profile) hostconfig.Host {
+	return hostconfig.Host{Alias: profile.Alias, Source: hostconfig.SourceManaged, Editable: true, HostName: profile.HostName, Port: profile.Port, Username: profile.Username, IdentityFile: profile.IdentityFile, JumpHost: profile.JumpHost, Valid: true}
+}
+
+func (a *App) hostMutationBlock(alias string) string {
+	status := a.sessions.Snapshot(alias).Status
+	if status == sshmanager.StatusConnecting || status == sshmanager.StatusConnected || status == sshmanager.StatusDisconnecting {
+		return "SSH Host 正在使用，无法修改或删除"
+	}
+	for _, snapshot := range a.tunnels.List() {
+		if snapshot.Host == alias && tunnelBlocksHostMutation(snapshot.Status) {
+			return "SSH Host 仍有运行中或重连中的隧道"
+		}
+	}
+	if references := a.catalog.ReferencedBy(alias); len(references) > 0 {
+		return "SSH Host 仍被其他配置用作跳板机"
+	}
+	return ""
+}
+
+func tunnelBlocksHostMutation(status tunnel.Status) bool {
+	switch status {
+	case tunnel.StatusStarting, tunnel.StatusRunning, tunnel.StatusWaitingReconnect, tunnel.StatusReconnecting, tunnel.StatusStopping:
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *App) clearCredentials(ctx context.Context, profile hostconfig.Profile) error {
+	if a.credentials == nil {
+		return nil
+	}
+	for _, purpose := range []string{"password", "passphrase"} {
+		err := a.credentials.Delete(ctx, credential.Ref{Host: profile.Alias, Username: profile.Username, Purpose: purpose})
+		if err != nil && !errors.Is(err, credential.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeHostConfigError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, hostconfig.ErrInvalidJump):
+		writeError(w, http.StatusBadRequest, "invalid_jump_host", "跳板机配置无效")
+	case errors.Is(err, hostconfig.ErrInvalid):
+		writeError(w, http.StatusBadRequest, "invalid_host_config", "SSH Host 配置无效")
+	case errors.Is(err, hostconfig.ErrConflict):
+		writeError(w, http.StatusConflict, "host_conflict", "SSH Host 别名已存在")
+	case errors.Is(err, hostconfig.ErrReferenced):
+		writeError(w, http.StatusConflict, "host_in_use", "SSH Host 仍被其他配置引用")
+	case errors.Is(err, hostconfig.ErrNotFound):
+		writeError(w, http.StatusNotFound, "managed_host_not_found", "项目 SSH Host 不存在")
+	case errors.Is(err, hostconfig.ErrUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "managed_config_unavailable", "项目 SSH Host 配置不可用")
+	default:
+		writeError(w, http.StatusInternalServerError, "host_config_failed", "SSH Host 配置操作失败")
+	}
 }
 
 func (a *App) handleServer(w http.ResponseWriter, r *http.Request) {
@@ -167,16 +428,18 @@ type connectRequest struct {
 
 func (a *App) handleConnect(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
-	if !a.hostExists(host) {
-		writeError(w, http.StatusNotFound, "host_not_found", "SSH Host 不存在于当前配置")
-		return
-	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	var request connectRequest
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "连接请求格式无效")
+		return
+	}
+	a.hostOps.Lock()
+	defer a.hostOps.Unlock()
+	if !a.hostExists(host) {
+		writeError(w, http.StatusNotFound, "host_not_found", "SSH Host 不存在于当前配置")
 		return
 	}
 	snapshot, err := a.sessions.Connect(r.Context(), host, sshmanager.ConnectOptions{
@@ -204,6 +467,8 @@ func (a *App) handleConnect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleDisconnect(w http.ResponseWriter, r *http.Request) {
+	a.hostOps.Lock()
+	defer a.hostOps.Unlock()
 	host := r.PathValue("host")
 	if !a.hostExists(host) {
 		writeError(w, http.StatusNotFound, "host_not_found", "SSH Host 不存在于当前配置")
@@ -237,6 +502,8 @@ func (a *App) handleCreateTunnel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "隧道创建请求格式无效")
 		return
 	}
+	a.hostOps.Lock()
+	defer a.hostOps.Unlock()
 	if !a.requireHost(w, request.Host) {
 		return
 	}

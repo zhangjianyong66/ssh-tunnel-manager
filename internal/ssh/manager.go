@@ -13,9 +13,9 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/credential"
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/sshconfig"
 )
 
 // Status is the lifecycle state of a server connection.
@@ -708,15 +708,7 @@ func (s *session) snapshot() Snapshot {
 }
 
 func validateHost(host string) error {
-	if host == "" || strings.HasPrefix(host, "-") {
-		return errors.New("SSH Host 别名无效")
-	}
-	for _, r := range host {
-		if unicode.IsSpace(r) || unicode.IsControl(r) || strings.ContainsRune("*?!", r) {
-			return errors.New("SSH Host 别名无效")
-		}
-	}
-	return nil
+	return sshconfig.ValidateAlias(host)
 }
 
 func validateRemoteCommand(command []string) error {

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/credential"
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/hostconfig"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/portdiscovery"
 	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/preference"
 	sshmanager "github.com/zhangjianyong66/ssh-tunnel-manager/internal/ssh"
@@ -61,7 +62,8 @@ func main() {
 		log.Fatalf("创建 SSH 运行目录失败: %v", err)
 	}
 	defer os.RemoveAll(runtimeDir)
-	manager, err := sshmanager.NewManager(sshmanager.RealRunner{}, credential.NewSecretServiceStore(), runtimeDir)
+	credentials := credential.NewSecretServiceStore()
+	manager, err := sshmanager.NewManager(sshmanager.RealRunner{}, credentials, runtimeDir)
 	if err != nil {
 		log.Fatalf("初始化 SSH 管理器失败: %v", err)
 	}
@@ -82,7 +84,23 @@ func main() {
 		}
 	}
 	configPath := filepath.Join(userHomeDir(), ".ssh", "config")
-	app, err := web.NewApp(configPath, manager, discovery, tunnels, preferences)
+	var managedHosts hostconfig.Store
+	hostConfigPath, hostConfigPathErr := hostconfig.DefaultPath()
+	if hostConfigPathErr != nil {
+		log.Printf("获取项目 SSH Host 配置路径失败，页面配置功能已只读: %v", hostConfigPathErr)
+		managedHosts = hostconfig.NewUnavailableStore(hostConfigPathErr)
+	} else {
+		store, loadErr := hostconfig.NewFileStore(hostConfigPath)
+		managedHosts = store
+		if loadErr != nil {
+			log.Printf("读取项目 SSH Host 配置失败，页面配置功能已只读: %v", loadErr)
+		}
+	}
+	catalog, err := hostconfig.NewCatalog(context.Background(), configPath, managedHosts)
+	if err != nil {
+		log.Fatalf("初始化 SSH Host 配置失败: %v", err)
+	}
+	app, err := web.NewAppWithCatalog(catalog, credentials, manager, discovery, tunnels, preferences)
 	if err != nil {
 		log.Fatalf("初始化 Web 控制台失败: %v", err)
 	}

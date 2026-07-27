@@ -9,9 +9,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
-	"unicode"
+
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/configfile"
+	"github.com/zhangjianyong66/ssh-tunnel-manager/internal/sshconfig"
 )
 
 const (
@@ -166,61 +167,12 @@ func cloneConfig(source config) config {
 }
 
 func writeConfig(path string, value config) error {
-	if path == "" {
-		return errors.New("偏好设置路径为空")
-	}
-	directory := filepath.Dir(path)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return fmt.Errorf("创建偏好设置目录失败: %w", err)
-	}
-	if err := os.Chmod(directory, 0o700); err != nil {
-		return fmt.Errorf("设置偏好目录权限失败: %w", err)
-	}
-	temporary, err := os.CreateTemp(directory, ".config-*")
-	if err != nil {
-		return fmt.Errorf("创建偏好临时文件失败: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("设置偏好文件权限失败: %w", err)
-	}
-	encoder := json.NewEncoder(temporary)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(value); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("编码偏好设置失败: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("同步偏好设置失败: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("关闭偏好设置失败: %w", err)
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
+	if err := configfile.WriteJSON(path, value); err != nil {
 		return fmt.Errorf("保存偏好设置失败: %w", err)
-	}
-	directoryHandle, err := os.Open(directory)
-	if err != nil {
-		return fmt.Errorf("打开偏好设置目录失败: %w", err)
-	}
-	defer directoryHandle.Close()
-	if err := directoryHandle.Sync(); err != nil {
-		return fmt.Errorf("同步偏好设置目录失败: %w", err)
 	}
 	return nil
 }
 
 func validateHost(host string) error {
-	if host == "" || strings.HasPrefix(host, "-") {
-		return errors.New("SSH Host 别名无效")
-	}
-	for _, character := range host {
-		if unicode.IsSpace(character) || unicode.IsControl(character) || strings.ContainsRune("*?!", character) {
-			return errors.New("SSH Host 别名无效")
-		}
-	}
-	return nil
+	return sshconfig.ValidateAlias(host)
 }
