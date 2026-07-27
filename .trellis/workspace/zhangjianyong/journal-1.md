@@ -337,3 +337,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: 补齐源码一键启动与收尾验收
+
+**Date**: 2026-07-27
+**Task**: 补齐源码一键启动与收尾验收
+**Branch**: `master`
+
+### Summary
+
+完成 start.sh：检查 Go 1.22+、OpenSSH 和 xdg-open，支持从任意目录启动、参数透传和自动打开本地控制台；更新 README 与运行规范。通过 sh -n、仓库外 --version、自定义端口启动、依赖缺失场景、go test -race ./...、go vet ./... 和 go build ./cmd/ssh-tunnel-manager。真实 FRP/Mac/Ubuntu 链路未在本机执行。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0b0137c` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

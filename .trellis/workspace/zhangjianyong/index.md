@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 10
+- **Total Sessions**: 11
 - **Last Active**: 2026-07-27
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~339 | Active |
+| `journal-1.md` | ~372 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 11 | 2026-07-27 | 补齐源码一键启动与收尾验收 | `0b0137c` | `master` |
 | 10 | 2026-07-27 | 完成里程碑2跳板连接与安全挑战 | `3b25828` | `master` |
 | 9 | 2026-07-27 | 实现 Host 配置基础里程碑 | `b537ea1`, `c7b6242` | `master` |
 | 8 | 2026-07-25 | 完成SSH隧道管理器MVP整体验收 | `cdce750` | `master` |
