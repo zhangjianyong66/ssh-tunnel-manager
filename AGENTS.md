@@ -21,7 +21,7 @@
 ## 配置与秘密
 
 - 只读系统 `~/.ssh/config`，不直接修改该文件。
-- 当前只保存每个 Host 的端口自动刷新偏好，路径为 `${XDG_CONFIG_HOME:-~/.config}/ssh-tunnel-manager/config.json`，目录权限 `0700`、文件权限 `0600`；启动时不得自动连接。
+- 端口自动刷新偏好保存到 `${XDG_CONFIG_HOME:-~/.config}/ssh-tunnel-manager/config.json`；页面管理的非敏感 SSH Host 保存到同目录 `hosts.json`。目录权限 `0700`、文件权限 `0600`，损坏文件不得被自动覆盖；启动时不得自动连接。
 - 隧道事件和脱敏 SSH 诊断只在内存中有界保留，停止隧道或退出程序后清除，不写磁盘。
 - 密码和私钥口令使用 Linux Secret Service / GNOME Keyring 持久化，禁止明文落盘和写日志。
 - 控制台只允许本机访问，并使用进程启动时生成的随机令牌。
@@ -37,7 +37,7 @@ go build ./cmd/ssh-tunnel-manager
 
 ## 当前目录与运行约定
 
-- cmd/ssh-tunnel-manager/main.go 是当前唯一可执行入口；internal/credential 负责 Secret Service，internal/ssh 负责 OpenSSH ControlMaster 生命周期和受控远程命令，internal/portdiscovery 负责 `ss` 解析、端口快照与自动刷新，internal/preference 负责 XDG 非敏感偏好，internal/tunnel 负责回环端口分配、自动重连、隧道状态和精确进程清理，internal/sshconfig 负责 SSH 配置解析，internal/web 负责本地页面和 API；docs/ 保存产品、架构和路线文档。
+- cmd/ssh-tunnel-manager/main.go 是当前唯一可执行入口；internal/configfile 负责私有权限原子配置写入，internal/hostconfig 负责项目 Host 存储、系统/项目 Catalog 与受控 OpenSSH 配置渲染，internal/credential 负责 Secret Service，internal/ssh 负责 OpenSSH ControlMaster 生命周期和受控远程命令，internal/portdiscovery 负责 `ss` 解析、端口快照与自动刷新，internal/preference 负责 XDG 非敏感偏好，internal/tunnel 负责回环端口分配、自动重连、隧道状态和精确进程清理，internal/sshconfig 负责系统 SSH 配置与 `ssh -G` 有效配置解析，internal/web 负责本地页面和 API；docs/ 保存产品、架构和路线文档。
 - 本地开发使用 go run ./cmd/ssh-tunnel-manager，默认控制台地址为 127.0.0.1:8765；构建使用 go build -o ssh-tunnel-manager ./cmd/ssh-tunnel-manager。
 - 测试文件与对应 Go 包同目录；涉及并发连接、端口刷新或生命周期的变更必须运行 `go test -race ./...`，并继续运行 `go vet ./...` 和构建命令。
 - 当前部署仍是直接运行单文件 Linux 可执行程序，M5 提供用户级安装脚本和桌面入口，但不提供 systemd 单元或容器暴露配置；不得通过部署配置把回环服务暴露到局域网或公网。
