@@ -80,8 +80,16 @@ ssh-tunnel-manager
 需要 Go 1.22 或更高版本和系统 OpenSSH：
 
 ```bash
-go run ./cmd/ssh-tunnel-manager
+./start.sh
 ```
+
+`start.sh` 会检查本地依赖、在前台启动程序并自动打开浏览器；在其他目录中也可以通过脚本的完整路径运行。需要更换本地端口时，可以传入原程序参数：
+
+```bash
+./start.sh --addr 127.0.0.1:8766
+```
+
+也可以不使用脚本，直接运行 `go run ./cmd/ssh-tunnel-manager --open-browser`。脚本和直接运行都使用 `Ctrl+C` 停止服务。
 
 构建：
 
@@ -105,6 +113,7 @@ go build ./cmd/ssh-tunnel-manager
 ## 目录结构
 
 ```text
+start.sh                源码目录一键启动脚本
 cmd/ssh-tunnel-manager/  可执行程序入口
 internal/credential/     Secret Service 凭据接口与适配器
 internal/portdiscovery/  远程 TCP 监听端口解析与刷新状态
